@@ -1,6 +1,6 @@
 // Модель хранилища команды.
 //
-// Файлы в папке Dropbox (всё, кроме публичных ключей и имён, зашифровано):
+// Файлы на сервере (всё, кроме публичных ключей и имён, зашифровано):
 //   org.json            - состав команды, коллекции и ключи коллекций, запечатанные
 //                         для каждого участника. Подписан владельцем или админом.
 //   users/<uid>.json    - участник: публичные ключи + секретные ключи под мастер-паролем.
@@ -79,10 +79,15 @@ export function accessOf(org, col) {
   return uids.filter(uid => col.members.includes(uid) || org.members[uid].role !== 'member');
 }
 
-const fake = () => new VaultError('Файл команды повреждён или подделан. Восстановите прошлую версию org.json в Dropbox.');
+const fake = () => new VaultError('Файл команды повреждён или подделан. Сообщите владельцу команды.');
+
+const isVer = n => Number.isSafeInteger(n) && n >= 1;
 
 export async function verifyOrg(org, pin, seen) {
   if (!org || org.v !== 1 || org.orgId !== pin.orgId) throw fake();
+  // Версии - целые числа: иначе сравнение «не старше ли» тихо отключается (undefined < n === false)
+  if (!isVer(org.version) || !isVer(org.adminCert?.certVersion)) throw fake();
+  if (!org.members || typeof org.members !== 'object' || !org.collections || typeof org.collections !== 'object') throw fake();
   const owner = org.members?.[org.owner?.uid];
   if (org.owner.signPk !== pin.ownerSignPk || !owner || owner.role !== 'owner' || owner.signPk !== pin.ownerSignPk) throw fake();
   // Ключи владельца не меняются никогда - админ не может «запереть» владельца
@@ -109,9 +114,17 @@ export async function verifyOrg(org, pin, seen) {
   }
   for (const uid of Object.keys(c.admins)) if (!Object.hasOwn(org.members, uid)) throw fake();
 
+  // У каждого, кому положен доступ к коллекции (владелец и админы - ко всем), должен быть его ключ.
+  // Иначе админ мог бы тихо отрезать владельца от коллекции.
+  for (const [cid, col] of Object.entries(org.collections)) {
+    if (!/^[0-9a-f]{24}$/.test(cid) || !isVer(col?.keyVersion) || !Array.isArray(col.members) || !col.wraps || typeof col.wraps !== 'object' || !col.nameBox) throw fake();
+    for (const uid of accessOf(org, col)) if (!Object.hasOwn(col.wraps, uid)) throw fake();
+    for (const uid of Object.keys(col.wraps)) if (!Object.hasOwn(org.members, uid)) throw fake();
+  }
+
   const last = seen?.get(org.orgId);
   if (last && (org.version < last.version || c.certVersion < last.certVersion)) {
-    throw new VaultError('В Dropbox лежит более старая версия файла команды, чем это устройство уже видело. Похоже на откат или подмену.');
+    throw new VaultError('На сервере более старая версия файла команды, чем это устройство уже видело. Похоже на откат или подмену.');
   }
 }
 
@@ -317,7 +330,7 @@ export class Session {
 
   async refresh() {
     const r = await readOrg(this.s);
-    if (!r) throw new VaultError('Файл команды не найден в папке Dropbox');
+    if (!r) throw new VaultError('Файл команды не найден на сервере');
     await verifyOrg(r.org, this.me.pin, this.seen);
     const m = Object.hasOwn(r.org.members, this.me.uid) ? r.org.members[this.me.uid] : null;
     if (this.member && !m) throw new RemovedError('Вас удалили из команды. Данные команды больше недоступны.');
@@ -341,22 +354,29 @@ export class Session {
   async unwrapKeys() {
     const keys = new Map();
     const names = new Map();
+    const broken = [];
     if (this.member) {
       for (const [cid, col] of Object.entries(this.org.collections)) {
         const w = col.wraps[this.me.uid];
         if (!w) continue;
-        const key = await C.openSealed(this.me.boxSk, this.me.boxPk, w, adWrap(this.orgId, cid, col.keyVersion, this.me.uid));
-        const old = {};
-        if (col.history) {
-          const h = await C.decryptJSON(key, col.history, adHist(this.orgId, cid, col.keyVersion));
-          for (const [v, k] of Object.entries(h)) old[v] = C.b64d(k);
+        // Испорченный ключ одной коллекции не должен закрывать вход и остальные коллекции
+        try {
+          const key = await C.openSealed(this.me.boxSk, this.me.boxPk, w, adWrap(this.orgId, cid, col.keyVersion, this.me.uid));
+          const old = {};
+          if (col.history) {
+            const h = await C.decryptJSON(key, col.history, adHist(this.orgId, cid, col.keyVersion));
+            for (const [v, k] of Object.entries(h)) old[v] = C.b64d(k);
+          }
+          names.set(cid, String(await C.decryptJSON(key, col.nameBox, adName(this.orgId, cid, col.keyVersion))));
+          keys.set(cid, { ver: col.keyVersion, key, old });
+        } catch {
+          broken.push(cid);
         }
-        keys.set(cid, { ver: col.keyVersion, key, old });
-        names.set(cid, String(await C.decryptJSON(key, col.nameBox, adName(this.orgId, cid, col.keyVersion))));
       }
     }
     this.keys = keys;
     this.names = names;
+    this.brokenKeys = broken; // коллекции, ключ которых не открылся (видно в разделе «Команда»)
   }
 
   // Коллекции, к которым у меня есть доступ
@@ -403,18 +423,18 @@ export class Session {
     const r = await this.s.read(vaultPath(cid));
     if (!r) {
       // Файла нет, а устройство уже видело записи - значит, его удалили, а не «коллекция пустая»
-      if (last?.seq > 0) throw new VaultError('Файл коллекции «' + this.collectionName(cid) + '» пропал из Dropbox. Восстановите его из удалённых файлов Dropbox.');
+      if (last?.seq > 0) throw new VaultError('Файл коллекции «' + this.collectionName(cid) + '» пропал с сервера. Сообщите владельцу команды.');
       return { items: {}, rev: null, seq: 0 };
     }
     const f = JSON.parse(r.text);
     if (f.cid !== cid) throw new VaultError('Файл коллекции подменён');
     // Подпись автора: без неё бывший участник, знающий старый ключ, мог бы подложить свои записи
     const pk = this.writerPk(cid, f.signer, asOrg);
-    if (!pk || !Number.isInteger(f.seq) || !await C.verifyObj(pk, f.sig, vaultPayload(this.orgId, f))) {
-      throw new VaultError('Файл коллекции «' + this.collectionName(cid) + '» подписан не участником с доступом. Восстановите прошлую версию в Dropbox.');
+    if (!pk || !Number.isSafeInteger(f.seq) || f.seq < 1 || !await C.verifyObj(pk, f.sig, vaultPayload(this.orgId, f))) {
+      throw new VaultError('Файл коллекции «' + this.collectionName(cid) + '» подписан не участником с доступом. Сообщите владельцу команды.');
     }
     if (last && f.seq < last.seq) {
-      throw new VaultError('В Dropbox лежит более старая версия коллекции «' + this.collectionName(cid) + '», чем это устройство уже видело.');
+      throw new VaultError('На сервере более старая версия коллекции «' + this.collectionName(cid) + '», чем это устройство уже видело.');
     }
     const { items } = await C.decryptJSON(this.keyFor(cid, f.keyVersion), f.data, adVault(this.orgId, cid, f.keyVersion));
     this.bumpVaultSeen(cid, f.seq);

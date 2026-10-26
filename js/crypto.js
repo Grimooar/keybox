@@ -17,7 +17,7 @@ export function randomBytes(n) {
   return globalThis.crypto.getRandomValues(new Uint8Array(n));
 }
 
-// Hex, а не base64: пути в Dropbox не различают регистр букв
+// Hex, а не base64: id попадают в пути файлов, где регистр букв лучше не различать
 export function randomHex(n = 16) {
   return [...randomBytes(n)].map(b => b.toString(16).padStart(2, '0')).join('');
 }
@@ -59,7 +59,9 @@ export function canonical(v) {
 export async function deriveMasterKey(password, kdf) {
   if (kdf.alg !== 'argon2id') throw new CryptoError('Неизвестный алгоритм ключа');
   // Границы, чтобы подменённые параметры не подвесили устройство
-  if (!(kdf.m >= 16384 && kdf.m <= 262144 && kdf.t >= 1 && kdf.t <= 10 && kdf.p >= 1 && kdf.p <= 4)) {
+  // Нижняя граница = наши настройки по умолчанию: сервер не может «облегчить» перебор,
+  // подсунув при входе слабые параметры
+  if (!(kdf.m >= KDF_DEFAULT.m && kdf.m <= 262144 && kdf.t >= KDF_DEFAULT.t && kdf.t <= 10 && kdf.p >= 1 && kdf.p <= 4)) {
     throw new CryptoError('Недопустимые параметры ключа');
   }
   return globalThis.hashwasm.argon2id({

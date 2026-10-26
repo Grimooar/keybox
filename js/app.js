@@ -149,6 +149,10 @@ async function start() {
   state.team = LS.get('team');
   const setupCode = sessionGet('setup');
   if (setupCode && !state.team) return screenCreateTeam(setupCode);
+  if (sessionGet('badlink')) {
+    sessionSet('badlink', null);
+    if (!state.team) return screenNoTeam('Ссылка неполная: в ней нет кода команды. Скопируйте её целиком или попросите новую.');
+  }
   if (!state.team) return screenNoTeam();
   state.storage = new CachedStorage(new ApiStorage(API_URL, state.team.secret), 'team');
   state.storage.invite = sessionGet('invite');
@@ -171,8 +175,10 @@ function readLink() {
   if (p.has('setup')) sessionSet('setup', p.get('setup'));
   if (p.has('t')) {
     const team = { secret: p.get('t'), code: codeDigits(p.get('c')) };
+    // Без кода команды ссылке нельзя доверять: им проверяется, что сервер не подменил команду
+    if (team.code.length !== 20) { sessionSet('badlink', '1'); return; }
     const cur = LS.get('team');
-    if (cur && cur.secret !== team.secret) forgetDevice();
+    if (cur && cur.code !== team.code) forgetDevice(); // другая команда; новая ссылка той же - просто обновляем
     LS.set('team', team);
   }
   if (p.has('i')) sessionSet('invite', p.get('i'));
@@ -219,7 +225,7 @@ async function screenEntry() {
   if (!r) return state.demo ? screenCreateTeam(null) : screenNoTeam();
   // Код команды из ссылки - защита от подмены: сервер не может выдать чужую «команду»
   const code = await V.teamCode(r.org);
-  if (!state.demo && state.team.code && codeDigits(code) !== state.team.code) {
+  if (!state.demo && codeDigits(code) !== state.team.code) {
     return authCard('Ссылка не совпадает с командой', 'Код команды на сервере не тот, что в вашей ссылке. Ничего не вводите и сообщите владельцу.',
       h('button', { class: 'btn link', onclick: () => { forgetDevice(); start(); } }, 'Забыть эту ссылку'));
   }
@@ -725,7 +731,11 @@ async function renderTeam() {
       ? h('div', null,
         h('p', { class: 'muted small' }, 'Чтобы позвать человека, отправьте ему ссылку-приглашение. Он откроет её, придумает мастер-пароль, а вы примете заявку здесь.'),
         h('button', { class: 'btn primary', onclick: e => run(() => inviteDialog(), e.currentTarget) }, icon('plus'), 'Пригласить'))
-      : h('p', { class: 'muted small' }, 'Приглашать новых участников могут владелец и админы.')));
+      : h('p', { class: 'muted small' }, 'Приглашать новых участников могут владелец и админы.'),
+    s.isOwner && !state.demo ? h('button', { class: 'btn link', onclick: e => run(() => rotateTeamLink(), e.currentTarget) }, 'Сменить ссылку команды') : null));
+  if (s.brokenKeys?.length) {
+    body.append(h('div', { class: 'banner' }, icon('shield'), h('span', null, `Ключ к ${s.brokenKeys.length} коллекц. не открывается: файл команды подписал ${s.org.members[s.org.signer]?.name || '?'}. Обратитесь к владельцу.`)));
+  }
 
   if (s.pending) {
     body.append(h('div', { class: 'banner' }, icon('clock'), h('span', null, 'Ваша заявка ждёт одобрения. Ваш код: ', h('strong', { class: 'code' }, await s.myCode()))));
@@ -769,8 +779,12 @@ async function renderTeam() {
           await s.removeMember(uid);
           await modal(m.name + ' удалён из команды', h('div', null,
             h('p', null, 'Сервер больше не пускает его, ключи его коллекций сменены.'),
-            h('p', { class: 'warn' }, icon('shield'), 'Но пароли, которые он уже видел, он мог запомнить или скопировать. Смените важные пароли на самих сайтах.')),
-          [{ label: 'Понятно', kind: 'primary', value: true }]);
+            h('p', { class: 'warn' }, icon('shield'), 'Но пароли, которые он уже видел, он мог запомнить или скопировать. Смените важные пароли на самих сайтах.'),
+            s.isOwner && !state.demo ? h('p', { class: 'muted small' }, 'У него осталась ссылка команды: по ней видно, кто в команде. Чтобы закрыть и это, смените ссылку команды.') : null),
+          [
+            ...(s.isOwner && !state.demo ? [{ label: 'Сменить ссылку команды', onClick: () => rotateTeamLink().then(() => true) }] : []),
+            { label: 'Понятно', kind: 'primary', value: true },
+          ]);
           await s.loadAll(); renderNav(); renderContent();
         }, e.currentTarget)) : null));
   })));
@@ -798,6 +812,19 @@ async function inviteDialog() {
     h('p', null, 'Отправьте эту ссылку коллеге (лично, в мессенджере):'),
     h('div', { class: 'code-row' }, h('code', null, link), iconBtn('copy', 'Скопировать', () => copy(link, 'Ссылка скопирована', false))),
     h('p', { class: 'muted small' }, `Действует до ${formatDate(expires)}, по ней можно вступить до 25 человек. Каждую заявку вы всё равно принимаете вручную.`)),
+  [{ label: 'Скопировать и закрыть', kind: 'primary', onClick: () => copy(link, 'Ссылка скопирована', false).then(() => true) }]);
+}
+
+async function rotateTeamLink() {
+  if (!await confirmDialog('Сменить ссылку команды?', 'Старая ссылка и все приглашения перестанут работать. Каждому участнику нужно будет один раз открыть новую ссылку на каждом своём устройстве.', 'Сменить')) return;
+  const secret = C.b64e(C.randomBytes(24));
+  await state.storage.rotateTeamSecret(secret);
+  state.team = { ...state.team, secret };
+  LS.set('team', state.team);
+  const link = teamLink();
+  await modal('Новая ссылка команды', h('div', null,
+    h('p', null, 'Отправьте её участникам. Им нужно открыть её и войти своим мастер-паролем, как обычно.'),
+    h('div', { class: 'code-row' }, h('code', null, link), iconBtn('copy', 'Скопировать', () => copy(link, 'Ссылка скопирована', false)))),
   [{ label: 'Скопировать и закрыть', kind: 'primary', onClick: () => copy(link, 'Ссылка скопирована', false).then(() => true) }]);
 }
 

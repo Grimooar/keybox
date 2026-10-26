@@ -139,6 +139,13 @@ export class ApiStorage {
     if (!r.ok) throw ApiStorage.fail(r, data);
     return data;
   }
+
+  // Новая ссылка команды (только владелец). Старая сразу перестаёт работать.
+  async rotateTeamSecret(secret) {
+    const { r, data } = await this.req('POST', 'api/team-secret', JSON.stringify({ teamHash: await sha256b64(secret) }));
+    if (!r.ok) throw ApiStorage.fail(r, data);
+    this.team = secret;
+  }
 }
 
 // Обёртка: запоминает последние прочитанные (зашифрованные) ответы,
@@ -196,6 +203,7 @@ export class CachedStorage {
   status() { return this.inner.status(); }
   setup(p) { return this.inner.setup(p); }
   createInvite() { return this.inner.createInvite(); }
+  rotateTeamSecret(secret) { return this.inner.rotateTeamSecret(secret); }
 
   async write(path, text, rev) {
     const newRev = await this.inner.write(path, text, rev);

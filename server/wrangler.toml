@@ -4,7 +4,7 @@ compatibility_date = "2026-10-01"
 workers_dev = true
 
 [vars]
-ALLOWED_ORIGINS = "https://grimooar.github.io,http://localhost:8765"
+ALLOWED_ORIGINS = "https://grimooar.github.io"
 
 [[d1_databases]]
 binding = "DB"

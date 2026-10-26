@@ -1,7 +1,7 @@
 // Офлайн-оболочка: файлы приложения берём из сети, а без сети - из кэша.
-// Запросы к Dropbox не кэшируются здесь (их зашифрованный кэш ведёт само приложение).
+// Запросы к серверу здесь не кэшируются (их зашифрованный кэш ведёт само приложение).
 
-const CACHE = 'keybox-v4';
+const CACHE = 'keybox-v5';
 const FILES = [
   './', 'index.html', 'manifest.webmanifest', 'css/app.css',
   'js/app.js', 'js/config.js', 'js/crypto.js', 'js/storage.js', 'js/tools.js', 'js/ui.js', 'js/vault.js',
@@ -21,7 +21,7 @@ self.addEventListener('activate', e => {
 self.addEventListener('fetch', e => {
   const url = new URL(e.request.url);
   if (e.request.method !== 'GET' || url.origin !== location.origin) return;
-  // Возврат из Dropbox (?code=...) не кэшируем
+  // Адреса с параметрами не кэшируем
   if (url.search) {
     e.respondWith(fetch(e.request).catch(() => caches.match('index.html')));
     return;

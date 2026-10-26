@@ -55,7 +55,7 @@ await test('вход по паролю: неверный пароль и бло�
   // Подбор: 8 неудач -> блокировка, даже верный пароль не пускает
   for (let i = 0; i < 8; i++) await rejects(V.unlock(api(), owner.me.uid, 'guess' + i, dev()), /Неверный|попыток/);
   await rejects(V.unlock(api(), owner.me.uid, 'owner-pass', dev()), /Слишком много неверных попыток/);
-  await db.setFails(owner.me.uid, 0, 0); // снимаем блокировку для остальных тестов
+  db.attempts.clear(); // снимаем блокировку для остальных тестов
 });
 
 await test('файл участника с зашифрованными ключами не отдаётся без пароля', async () => {
@@ -195,6 +195,120 @@ await test('смена мастер-пароля через сервер', async
   f.signPk = (await C.generateUserKeys()).signPk;
   f.authHash = 'x'.repeat(43);
   await rejects(a.s.write('users/' + a.me.uid + '.json', JSON.stringify(f), cur.rev), /только пароль/);
+});
+
+// ---------- регрессия по аудиту серверной версии ----------
+
+const loginRaw = (uid, ip) => fetchFn(BASE + '/api/login', { method: 'POST', body: JSON.stringify({ uid, authKey: C.b64e(C.randomBytes(32)) }), headers: { 'X-KB-Team': TEAM, 'CF-Connecting-IP': ip } });
+async function signOrg(s, mutate) {
+  const cur = await s.s.read(V.ORG);
+  const d = JSON.parse(cur.text);
+  await mutate(d);
+  d.version = (d.version ?? 0) + 1;
+  d.signer = s.me.uid;
+  delete d.sig;
+  d.sig = await C.signObj(s.me.signSk, d);
+  return { text: JSON.stringify(d), rev: cur.rev };
+}
+
+await test('аудит 3: параллельный подбор не обходит лимит, а владельца с другого адреса не запирает', async () => {
+  db.attempts.clear();
+  const res = await Promise.all(Array.from({ length: 60 }, () => loginRaw(owner.me.uid, '6.6.6.6')));
+  const counts = res.reduce((m, r) => ({ ...m, [r.status]: (m[r.status] || 0) + 1 }), {});
+  assert.equal(counts[401], 8, JSON.stringify(counts));
+  assert.equal(counts[429], 52);
+  const s = await V.unlock(api(), owner.me.uid, 'owner-pass', dev()); // адрес 'local'
+  assert.equal(s.role, 'owner');
+  db.attempts.clear();
+});
+
+await test('аудит 2: «заморозить» коллекцию огромным номером версии нельзя', async () => {
+  const cur = await alice.s.read('vault/' + general + '.json');
+  const f = JSON.parse(cur.text);
+  for (const seq of [1e300, f.seq + 1000, f.seq]) {
+    const evil = { ...f, seq, signer: alice.me.uid };
+    evil.sig = await C.signObj(alice.me.signSk, { t: 'vault', orgId: owner.orgId, cid: general, keyVersion: f.keyVersion, seq, data: f.data, signer: alice.me.uid });
+    await assert.rejects(alice.s.write('vault/' + general + '.json', JSON.stringify(evil), cur.rev), e => e instanceof ConflictError || e.status === 400);
+  }
+  await owner.saveItem(general, item('После попытки заморозки'));
+});
+
+await test('аудит 1: админ не может отрезать владельца от коллекции; испорченный ключ не мешает войти', async () => {
+  await owner.setRole(alice.me.uid, 'admin');
+  await alice.refresh();
+  const drop = await signOrg(alice, d => { delete d.collections[ads].wraps[owner.me.uid]; });
+  await rejects(alice.s.write(V.ORG, drop.text, drop.rev), /не прошёл проверку/);
+  // Мусор вместо ключа сервер проверить не может - но вход и другие коллекции работают
+  const junk = await signOrg(alice, d => { d.collections[ads].wraps[owner.me.uid] = { epk: 'AAAA', iv: 'AAAA', ct: 'AAAA' }; });
+  await alice.s.write(V.ORG, junk.text, junk.rev);
+  const s = await V.unlock(api(), owner.me.uid, 'owner-pass', dev());
+  assert.deepEqual(s.brokenKeys, [ads]);
+  await s.loadAll();
+  assert.ok(s.allItems().some(i => i.name === 'Instagram'));
+  // Владелец возвращает свой ключ: Алиса (у неё ключ есть) перевыдаёт
+  const fix = await signOrg(alice, async d => {
+    d.collections[ads].wraps[owner.me.uid] = await C.sealTo(owner.me.boxPk, alice.keys.get(ads).key, `wrap:${owner.orgId}:${ads}:${d.collections[ads].keyVersion}:${owner.me.uid}`);
+  });
+  await alice.s.write(V.ORG, fix.text, fix.rev);
+  await owner.refresh();
+  assert.ok(owner.keys.has(ads) && !owner.brokenKeys.length);
+});
+
+await test('аудит 6: файл команды без номера версии не принимается', async () => {
+  const cur = await alice.s.read(V.ORG);
+  const d = JSON.parse(cur.text);
+  delete d.version;
+  d.signer = alice.me.uid;
+  delete d.sig;
+  d.sig = await C.signObj(alice.me.signSk, d);
+  await rejects(alice.s.write(V.ORG, JSON.stringify(d), cur.rev), /не прошёл проверку/);
+});
+
+await test('аудит 7: админ не может подменить ключи участника', async () => {
+  const s = api();
+  s.invite = (await owner.s.createInvite()).token;
+  const dan = await V.joinTeam(s, { userName: 'Дэн', password: 'dan-pass-long', seen: dev() });
+  await owner.approve(dan.me.uid, await dan.myCode(), []);
+  const k = await C.generateUserKeys();
+  const evil = await signOrg(alice, d => { d.members[dan.me.uid].signPk = k.signPk; d.members[dan.me.uid].boxPk = k.boxPk; });
+  await rejects(alice.s.write(V.ORG, evil.text, evil.rev), /не совпадают с его собственными/);
+  await owner.setRole(alice.me.uid, 'member');
+  await alice.refresh();
+});
+
+await test('аудит 9: лимит приглашения не обходится параллельными заявками', async () => {
+  const token = C.b64e(C.randomBytes(24));
+  await db.addInvite(await C.sha256b64(token), Date.now() + 60000, 1, owner.me.uid);
+  const tries = await Promise.allSettled(Array.from({ length: 5 }, (_, i) => {
+    const s = api();
+    s.invite = token;
+    return V.joinTeam(s, { userName: 'Гонщик ' + i, password: 'racer-pass-' + i, seen: dev() });
+  }));
+  assert.equal(tries.filter(t => t.status === 'fulfilled').length, 1);
+});
+
+await test('аудит 5: сервер не может подсунуть ослабленные параметры Argon2', async () => {
+  const sent = [];
+  const evilFetch = async (url, opts) => {
+    sent.push(url);
+    const r = await fetchFn(url, opts);
+    if (!url.includes('/api/prelogin/')) return r;
+    const d = await r.json();
+    return new Response(JSON.stringify({ kdf: { ...d.kdf, m: 16384, t: 1 } }), { status: 200 });
+  };
+  await rejects(V.unlock(new ApiStorage(BASE, TEAM, evilFetch), owner.me.uid, 'owner-pass', dev()), /Недопустимые параметры/);
+  assert.ok(!sent.some(u => u.includes('/api/login')), 'authKey не должен уйти на сервер');
+});
+
+await test('аудит 4: новая ссылка команды отключает старую', async () => {
+  await rejects(alice.s.rotateTeamSecret(C.b64e(C.randomBytes(24))), /только владелец/);
+  const fresh = C.b64e(C.randomBytes(24));
+  const ownerApi = api();
+  ownerApi.authenticate(owner.me.uid, owner.me.signSk);
+  await ownerApi.rotateTeamSecret(fresh);
+  await rejects(api(TEAM).people(), /Неверная ссылка/);
+  const people = await api(fresh).people();
+  assert.ok(people.some(p => p.uid === owner.me.uid));
 });
 
 await test('в базе сервера нет паролей и ключей в открытом виде', async () => {

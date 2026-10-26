@@ -12,18 +12,23 @@ import { verifyOrg, accessOf, isUid } from '../../js/vault.js';
 
 const ORG = 'org.json';
 const MAX_BODY = 2 * 1024 * 1024;
+const MAX_USER = 32 * 1024;
 const CLOCK_SKEW = 5 * 60 * 1000;
-const LOGIN_FAILS = 8;
-const LOCK_MS = 15 * 60 * 1000;
 const INVITE_TTL = 7 * 24 * 3600 * 1000;
 const INVITE_USES = 25;
+// Подбор пароля: с одного адреса - 8 попыток за 15 минут; на участника всего - 50 в час.
+// Лимит по адресу не даёт постороннему запереть владельца, общий - ограничивает перебор с многих адресов.
+const LIMITS = [
+  { key: (uid, ip) => `ip:${uid}:${ip}`, max: 8, window: 15 * 60 * 1000 },
+  { key: uid => `uid:${uid}`, max: 50, window: 60 * 60 * 1000 },
+];
 
 class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; }
 }
 const fail = (status, message) => { throw new HttpError(status, message); };
 
-async function sha(text) { return C.sha256b64(text); }
+const sha = text => C.sha256b64(text);
 
 function safeEqual(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
@@ -67,11 +72,18 @@ export async function handle(request, db, env) {
   }
 }
 
+async function readBody(request) {
+  if (!['PUT', 'POST'].includes(request.method)) return '';
+  if (Number(request.headers.get('Content-Length')) > MAX_BODY) fail(413, 'Слишком большой запрос');
+  const body = await request.text();
+  if (body.length > MAX_BODY) fail(413, 'Слишком большой запрос');
+  return body;
+}
+
 async function route(request, url, db, env) {
   const path = url.pathname.replace(/^\/+/, '');
   const method = request.method;
-  const body = ['PUT', 'POST'].includes(method) ? await request.text() : '';
-  if (body.length > MAX_BODY) fail(413, 'Слишком большой запрос');
+  const body = await readBody(request);
 
   if (path === 'api/status' && method === 'GET') {
     return { body: { team: !!(await db.meta('pin')) } };
@@ -84,23 +96,25 @@ async function route(request, url, db, env) {
   if (!safeEqual(await sha(request.headers.get('X-KB-Team') || ''), teamHash)) fail(403, 'Неверная ссылка команды');
 
   const pin = JSON.parse(await db.meta('pin'));
-  const ctx = { db, pin, orgId: pin.orgId };
+  const ctx = { db, pin, orgId: pin.orgId, ip: request.headers.get('CF-Connecting-IP') || 'local' };
   const orgRow = await db.get(ORG);
-  ctx.org = orgRow ? JSON.parse(orgRow.body) : null;
-  ctx.orgRev = orgRow?.rev;
+  ctx.org = JSON.parse(orgRow.body);
+  ctx.orgRev = orgRow.rev;
 
   if (path === 'api/people' && method === 'GET') return people(ctx);
   if (path.startsWith('api/prelogin/') && method === 'GET') return prelogin(ctx, path.slice(13));
   if (path === 'api/login' && method === 'POST') return login(ctx, body);
   if (path === 'api/f/org.json' && method === 'GET') return { body: { text: orgRow.body }, rev: orgRow.rev };
-  if (path === 'api/f/users/' + path.split('/').pop() && method === 'PUT' && request.headers.get('X-KB-Invite')) {
-    return joinRequest(ctx, path.slice(12).replace(/\.json$/, ''), body, request.headers.get('X-KB-Invite'));
+  const join = path.match(/^api\/f\/users\/([0-9a-f]{32})\.json$/);
+  if (join && method === 'PUT' && request.headers.get('X-KB-Invite')) {
+    return joinRequest(ctx, join[1], body, request.headers.get('X-KB-Invite'));
   }
 
   // Дальше - только подписанные запросы участников или заявок
   ctx.me = await identify(ctx, request, method, url.pathname + url.search, body);
 
   if (path === 'api/invites' && method === 'POST') return createInvite(ctx);
+  if (path === 'api/team-secret' && method === 'POST') return rotateTeamSecret(ctx, body);
   if (path === 'api/list/users' && method === 'GET') {
     requireAdmin(ctx);
     return { body: { names: (await db.list('users/')).map(p => p.slice(6)) } };
@@ -109,9 +123,13 @@ async function route(request, url, db, env) {
   const m = path.match(/^api\/f\/(org\.json|users\/([0-9a-f]{32})\.json|vault\/((?:p-[0-9a-f]{32})|[0-9a-f]{24})\.json)$/);
   if (!m) fail(404, 'Не найдено');
   const file = m[1];
-  const rev = url.searchParams.get('rev');
+  const revParam = url.searchParams.get('rev');
+  const rev = revParam === 'new' ? null : Number(revParam);
   if (method === 'GET') return readFile(ctx, file, m[2], m[3]);
-  if (method === 'PUT') return writeFile(ctx, file, m[2], m[3], body, rev === 'new' ? null : Number(rev));
+  if (method === 'PUT') {
+    if (rev !== null && !Number.isSafeInteger(rev)) fail(400, 'Неверная версия');
+    return writeFile(ctx, file, m[2], m[3], body, rev);
+  }
   if (method === 'DELETE') return deleteFile(ctx, file, m[2], m[3]);
   fail(405, 'Метод не поддерживается');
 }
@@ -125,23 +143,21 @@ async function setup(db, env, body) {
   const org = parseJson(req.org);
   const user = parseJson(req.user);
   const owner = org?.members?.[org?.owner?.uid];
-  if (!owner || user.uid !== org.owner.uid) fail(400, 'Неверные данные команды');
+  if (!owner || user.uid !== org.owner.uid || Object.keys(org.members).length !== 1) fail(400, 'Неверные данные команды');
   const pin = { orgId: org.orgId, ownerSignPk: org.owner.signPk, ownerBoxPk: owner.boxPk };
   await verifyOrg(org, pin).catch(() => fail(400, 'Файл команды не прошёл проверку'));
-  await checkNewUser(user, user.uid, pin.orgId);
+  await checkNewUser(user, user.uid, pin.orgId, req.user);
   if (owner.boxPk !== user.boxPk || owner.signPk !== user.signPk) fail(400, 'Ключи владельца не совпадают');
   if (typeof req.teamHash !== 'string' || req.teamHash.length < 40) fail(400, 'Нет секрета команды');
 
   const { authHash, ...stored } = user;
-  if (!await db.metaInit('pin', JSON.stringify(pin))) fail(409, 'Команда уже создана');
-  await db.setMeta('team', req.teamHash);
-  await db.put('users/' + user.uid, JSON.stringify(stored), null);
-  await db.setAuth(user.uid, authHash);
-  await db.put(ORG, req.org, null);
+  const ok = await db.setupAll({ pin: JSON.stringify(pin), teamHash: req.teamHash, uid: user.uid, userBody: JSON.stringify(stored), authHash, orgBody: req.org });
+  if (!ok) fail(409, 'Команда уже создана');
   return { status: 201, body: { ok: true } };
 }
 
-async function checkNewUser(f, uid, orgId) {
+async function checkNewUser(f, uid, orgId, raw) {
+  if (raw.length > MAX_USER) fail(413, 'Слишком большой файл участника');
   if (!isUid(uid) || f?.uid !== uid || f.v !== 1) fail(400, 'Неверный участник');
   if (typeof f.name !== 'string' || !f.name.trim() || f.name.length > 60) fail(400, 'Неверное имя');
   if (typeof f.authHash !== 'string' || f.authHash.length < 40) fail(400, 'Нет проверки пароля');
@@ -172,34 +188,35 @@ async function prelogin(ctx, uid) {
 
 async function login(ctx, body) {
   const { uid, authKey } = parseJson(body);
-  if (!isUid(uid) || typeof authKey !== 'string') fail(400, 'Неверный запрос');
+  if (!isUid(uid) || typeof authKey !== 'string' || authKey.length > 100) fail(400, 'Неверный запрос');
   const auth = await ctx.db.getAuth(uid);
   const row = await ctx.db.get('users/' + uid);
   if (!auth || !row) fail(404, 'Участник не найден. Возможно, его удалили из команды.');
+  // Попытка засчитывается ДО проверки пароля и атомарно - параллельный перебор не обходит лимит
   const now = Date.now();
-  if (auth.locked_until > now) fail(429, 'Слишком много неверных попыток. Подождите ' + Math.ceil((auth.locked_until - now) / 60000) + ' мин.');
-  if (!safeEqual(await sha(authKey), auth.hash)) {
-    const fails = auth.fails + 1;
-    await ctx.db.setFails(uid, fails >= LOGIN_FAILS ? 0 : fails, fails >= LOGIN_FAILS ? now + LOCK_MS : 0);
-    fail(401, 'Неверный мастер-пароль');
+  for (const l of LIMITS) {
+    const a = await ctx.db.attempt(l.key(uid, ctx.ip), now, l.window);
+    if (a.fails > l.max) {
+      fail(429, 'Слишком много неверных попыток. Подождите ' + Math.max(1, Math.ceil((a.window_start + l.window - now) / 60000)) + ' мин.');
+    }
   }
-  if (auth.fails) await ctx.db.setFails(uid, 0, 0);
+  if (!safeEqual(await sha(authKey), auth.hash)) fail(401, 'Неверный мастер-пароль');
+  await ctx.db.clearAttempts(LIMITS[0].key(uid, ctx.ip));
+  await ctx.db.forgive(LIMITS[1].key(uid));
   return { body: { text: row.body }, rev: row.rev };
 }
 
 // ---------- заявка по приглашению ----------
 
 async function joinRequest(ctx, uid, body, token) {
-  const inv = await ctx.db.getInvite(await sha(token));
-  if (!inv || inv.expires < Date.now() || inv.uses_left <= 0) fail(403, 'Приглашение недействительно или истекло. Попросите новое.');
   const f = parseJson(body);
-  await checkNewUser(f, uid, ctx.orgId);
-  if (Object.hasOwn(ctx.org.members, uid)) fail(409, 'Уже есть');
+  await checkNewUser(f, uid, ctx.orgId, body);
+  if (Object.hasOwn(ctx.org.members, uid) || await ctx.db.get('users/' + uid)) fail(409, 'Уже есть');
+  if (!await ctx.db.useInvite(await sha(token), Date.now())) fail(403, 'Приглашение недействительно или истекло. Попросите новое.');
   const { authHash, ...stored } = f;
   const rev = await ctx.db.put('users/' + uid, JSON.stringify(stored), null);
   if (rev == null) fail(409, 'Уже есть');
   await ctx.db.setAuth(uid, authHash);
-  await ctx.db.useInvite(inv.hash);
   return { status: 201, rev };
 }
 
@@ -210,6 +227,15 @@ async function createInvite(ctx) {
   return { status: 201, body: { token, expires: Date.now() + INVITE_TTL } };
 }
 
+// Новая ссылка команды: старая (например, у удалённого участника) перестаёт работать
+async function rotateTeamSecret(ctx, body) {
+  if (ctx.me.role !== 'owner') fail(403, 'Менять ссылку команды может только владелец');
+  const { teamHash } = parseJson(body);
+  if (typeof teamHash !== 'string' || teamHash.length < 40) fail(400, 'Нет секрета команды');
+  await ctx.db.setMeta('team', teamHash);
+  return { body: { ok: true } };
+}
+
 // ---------- подпись запроса ----------
 
 async function identify(ctx, request, method, fullPath, body) {
@@ -218,12 +244,12 @@ async function identify(ctx, request, method, fullPath, body) {
   if (!isUid(uid) || !sig) fail(401, 'Нужен вход');
   if (Math.abs(Date.now() - Number(ts)) > CLOCK_SKEW) fail(401, 'Неверное время на устройстве');
   let pk, role;
+  const row = await ctx.db.get('users/' + uid);
+  if (!row) fail(401, 'Участник удалён');
   if (Object.hasOwn(ctx.org.members, uid)) {
     pk = ctx.org.members[uid].signPk;
     role = ctx.org.members[uid].role;
   } else {
-    const row = await ctx.db.get('users/' + uid);
-    if (!row) fail(401, 'Участник удалён');
     pk = JSON.parse(row.body).signPk;
     role = 'pending';
   }
@@ -249,10 +275,9 @@ async function readFile(ctx, file, uid, cid) {
     const row = await ctx.db.get('users/' + uid);
     if (!row) return { status: 404, body: { error: 'Не найдено' } };
     // Зашифрованные ключи - только самому участнику; остальным - публичная часть (для одобрения заявки)
-    const f = JSON.parse(row.body);
     if (uid === ctx.me.uid) return { body: { text: row.body }, rev: row.rev };
     if (ctx.me.role === 'pending') fail(403, 'Нет доступа');
-    return { body: { text: JSON.stringify(publicUser(f)) }, rev: row.rev };
+    return { body: { text: JSON.stringify(publicUser(JSON.parse(row.body))) }, rev: row.rev };
   }
   if (!canReadVault(ctx, cid)) fail(403, 'Нет доступа к коллекции');
   const row = await ctx.db.get('vault/' + cid);
@@ -279,17 +304,26 @@ async function writeOrg(ctx, body, rev) {
   const seen = { get: () => ({ version: ctx.org.version + 1, certVersion: ctx.org.adminCert.certVersion }) };
   await verifyOrg(next, ctx.pin, seen).catch(e => fail(400, 'Файл команды не прошёл проверку: ' + e.message));
   if (next.signer !== ctx.me.uid) fail(400, 'Подписано не вами');
+  // Ключи каждого участника - те, что он сам прислал при вступлении (файл участника меняет только он).
+  // Так админ не может подставить свой ключ вместо чужого и действовать от имени участника.
+  for (const [uid, m] of Object.entries(next.members)) {
+    const row = await ctx.db.get('users/' + uid);
+    if (!row) fail(400, 'Участник без заявки: ' + m.name);
+    const f = JSON.parse(row.body);
+    if (f.signPk !== m.signPk || f.boxPk !== m.boxPk) fail(400, 'Ключи участника «' + m.name + '» не совпадают с его собственными');
+  }
   return cas(ctx, ORG, body, rev);
 }
 
 async function writeUser(ctx, uid, body, rev) {
   // Создание - только по приглашению (выше); здесь - смена мастер-пароля самим участником
   if (uid !== ctx.me.uid) fail(403, 'Можно менять только себя');
+  if (body.length > MAX_USER) fail(413, 'Слишком большой файл участника');
   const row = await ctx.db.get('users/' + uid);
   if (!row || rev !== row.rev) fail(409, 'Файл изменился, обновите данные');
   const cur = JSON.parse(row.body);
   const f = parseJson(body);
-  for (const k of ['uid', 'name', 'boxPk', 'signPk', 'selfSig', 'createdAt']) if (f[k] !== cur[k]) fail(400, 'Менять можно только пароль');
+  for (const k of ['v', 'uid', 'name', 'boxPk', 'signPk', 'selfSig', 'createdAt']) if (f[k] !== cur[k]) fail(400, 'Менять можно только пароль');
   if (typeof f.authHash !== 'string' || f.authHash.length < 40 || !f.secret?.ct || !f.kdf?.salt) fail(400, 'Неверные данные');
   const { authHash, ...stored } = f;
   const res = await cas(ctx, 'users/' + uid, JSON.stringify(stored), rev);
@@ -299,7 +333,7 @@ async function writeUser(ctx, uid, body, rev) {
 
 async function writeVault(ctx, cid, body, rev) {
   const f = parseJson(body);
-  if (f.cid !== cid || f.signer !== ctx.me.uid || !Number.isInteger(f.seq)) fail(400, 'Неверный файл коллекции');
+  if (f.cid !== cid || f.signer !== ctx.me.uid || !Number.isSafeInteger(f.seq) || !Number.isSafeInteger(f.keyVersion)) fail(400, 'Неверный файл коллекции');
   if (cid.startsWith('p-')) {
     if (cid.slice(2) !== ctx.me.uid || f.keyVersion !== 1) fail(403, 'Чужой личный сейф');
   } else {
@@ -308,11 +342,11 @@ async function writeVault(ctx, cid, body, rev) {
     if (f.keyVersion !== ctx.org.collections[cid].keyVersion) fail(409, 'Ключ коллекции сменился, обновите данные');
   }
   if (!await C.verifyObj(ctx.me.pk, f.sig, vaultPayload(ctx.orgId, f))) fail(400, 'Подпись файла неверна');
+  // Номер версии растёт строго на 1: нельзя ни откатить коллекцию, ни «заморозить» её огромным номером
   const row = await ctx.db.get('vault/' + cid);
-  if (row) {
-    if (rev !== row.rev) fail(409, 'Файл изменился, обновите данные');
-    if (!(f.seq > JSON.parse(row.body).seq)) fail(409, 'Старая версия коллекции');
-  } else if (rev != null) fail(409, 'Файл изменился, обновите данные');
+  const curSeq = row ? JSON.parse(row.body).seq : 0;
+  if (f.seq !== curSeq + 1) fail(409, 'Коллекция изменилась, обновите данные');
+  if ((row ? row.rev : null) !== rev) fail(409, 'Файл изменился, обновите данные');
   return cas(ctx, 'vault/' + cid, body, rev);
 }
 
@@ -324,11 +358,11 @@ async function deleteFile(ctx, file, uid, cid) {
     await ctx.db.del('users/' + uid);
     await ctx.db.delAuth(uid);
     await ctx.db.del('vault/p-' + uid);
-    return { status: 200, body: { ok: true } };
+    return { body: { ok: true } };
   }
   if (cid.startsWith('p-') ? Object.hasOwn(ctx.org.members, cid.slice(2)) : Object.hasOwn(ctx.org.collections, cid)) {
     fail(409, 'Коллекция ещё используется');
   }
   await ctx.db.del('vault/' + cid);
-  return { status: 200, body: { ok: true } };
+  return { body: { ok: true } };
 }

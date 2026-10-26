@@ -298,8 +298,8 @@ await test('аудит P2: удалённый файл коллекции не �
   const path = 'vault/' + general + '.json';
   const saved = await st.read(path);
   await st.remove(path);
-  await rejects(owner.readVault(general), /пропал из Dropbox/);
-  await rejects(owner.saveItem(general, item('X')), /пропал из Dropbox/);
+  await rejects(owner.readVault(general), /пропал с сервера/);
+  await rejects(owner.saveItem(general, item('X')), /пропал с сервера/);
   await st.write(path, saved.text, null);
   await owner.readVault(general);
 });
