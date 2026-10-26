@@ -191,7 +191,7 @@ await test('изменение состава коллекции и удален
   const ver = owner.org.collections[ads].keyVersion;
   await owner.updateCollection(ads, { members: [] });
   assert.equal(owner.org.collections[ads].keyVersion, ver + 1);
-  const tmp = Object.entries(owner.org.collections).find(([, c]) => c.name === 'Временная')[0];
+  const tmp = [...owner.names].find(([, n]) => n === 'Временная')[0];
   await owner.deleteCollection(tmp);
   assert.ok(!owner.org.collections[tmp]);
 });
@@ -274,9 +274,101 @@ await test('TOTP совпадает с эталоном RFC 6238', async () => {
   assert.equal(items[0].password, 'p"w');
 });
 
+// ---------- регрессия по аудиту ----------
+
+await test('аудит P1: удаление участника, который последним записал коллекцию', async () => {
+  const dan = await V.joinTeam(st, { userName: 'Дэн', password: 'dan-pass', seen: dev() });
+  await owner.approve(dan.me.uid, await dan.myCode(), [ads]);
+  await dan.refresh();
+  await dan.saveItem(general, item('От Дэна в общем'));
+  await dan.saveItem(ads, item('От Дэна в рекламе'));
+  await owner.removeMember(dan.me.uid);
+  await owner.loadAll();
+  for (const cid of [general, ads]) assert.ok(!owner.vaults.get(cid).error, owner.vaults.get(cid).error);
+  const names = owner.allItems().map(i => i.name);
+  assert.ok(names.includes('От Дэна в общем') && names.includes('От Дэна в рекламе'));
+  await owner.saveItem(general, item('После Дэна'));
+  assert.equal(await st.read('users/' + dan.me.uid + '.json'), null, 'файл участника удалён');
+  // Алиса (другое устройство) тоже читает
+  await alice.refresh();
+  await alice.loadAll();
+  assert.ok(!alice.vaults.get(general).error);
+});
+
+await test('аудит P2: удалённый файл коллекции не выглядит пустой коллекцией', async () => {
+  const path = 'vault/' + general + '.json';
+  const saved = await st.read(path);
+  await st.remove(path);
+  await rejects(owner.readVault(general), /пропал из Dropbox/);
+  await rejects(owner.saveItem(general, item('X')), /пропал из Dropbox/);
+  await st.write(path, saved.text, null);
+  await owner.readVault(general);
+});
+
+await test('аудит P3: админ не может подменить ключи владельца или другого админа', async () => {
+  await owner.setRole(alice.me.uid, 'admin');
+  await alice.refresh();
+  const carol = await V.joinTeam(st, { userName: 'Кэрол', password: 'carol-pass', seen: dev() });
+  await owner.approve(carol.me.uid, await carol.myCode(), []);
+  await owner.setRole(carol.me.uid, 'admin');
+  const evilKeys = await C.generateUserKeys();
+  for (const target of [owner.me.uid, carol.me.uid]) {
+    const orig = await st.read(V.ORG);
+    const d = JSON.parse(orig.text);
+    d.members[target].boxPk = evilKeys.boxPk;
+    d.version += 1;
+    d.signer = alice.me.uid;
+    delete d.sig;
+    d.sig = await C.signObj(alice.me.signSk, d);
+    await st.write(V.ORG, JSON.stringify(d), orig.rev);
+    await rejects(V.unlock(st, owner.me.uid, 'owner-pass', dev()), /подделан/);
+    await rejects(bob2Check(), /подделан/);
+    const cur = await st.read(V.ORG);
+    await st.write(V.ORG, orig.text, cur.rev);
+  }
+  async function bob2Check() { const s = await V.unlock(st, carol.me.uid, 'carol-pass', dev()); return s; }
+  await owner.refresh();
+  await owner.setRole(alice.me.uid, 'member');
+});
+
+await test('аудит п.6: вступление проверяет код команды, сверенный заранее', async () => {
+  const r = await V.readOrg(st);
+  const code = await V.teamCode(r.org);
+  await rejects(V.joinTeam(st, { userName: 'Ева', password: 'eve-pass', seen: dev(), expectedTeamCode: '1111 2222 3333 4444 5555' }), /Сверьте код команды/);
+  const eve = await V.joinTeam(st, { userName: 'Ева', password: 'eve-pass', seen: dev(), expectedTeamCode: code });
+  await owner.reject(eve.me.uid);
+});
+
+await test('аудит п.7: названия коллекций не лежат открытым текстом', async () => {
+  const text = (await st.read(V.ORG)).text;
+  for (const n of ['Общее', 'Реклама']) assert.ok(!text.includes(n), 'нашлось название: ' + n);
+  await alice.refresh();
+  assert.ok(!alice.collections().some(c => c.cid === ads));
+  assert.equal(alice.collectionName(ads), 'Закрытая коллекция');
+  await owner.updateCollection(ads, { name: 'Реклама 2' });
+  assert.equal(owner.collectionName(ads), 'Реклама 2');
+  // Переименование вместе со сменой ключа
+  await owner.updateCollection(ads, { name: 'Реклама', members: [alice.me.uid] });
+  await owner.updateCollection(ads, { name: 'Реклама 3', members: [] });
+  assert.equal(owner.collectionName(ads), 'Реклама 3');
+});
+
+await test('аудит: параметры Argon2 и кривые записи не роняют приложение', async () => {
+  await assert.rejects(C.deriveMasterKey('x', { alg: 'argon2id', salt: 'AAAA', m: 1048576, t: 20, p: 1 }), /Недопустимые/);
+  owner.vaults.set('bad', { items: { a: { name: 5, uris: 'x', history: [null, 3] }, b: null } });
+  const bad = owner.allItems().filter(i => i.cid === 'bad');
+  assert.equal(bad.length, 2);
+  assert.ok(bad.every(i => typeof i.name === 'string' && Array.isArray(i.uris) && Array.isArray(i.history)));
+  owner.vaults.delete('bad');
+  const T = await import('../js/tools.js');
+  await assert.rejects(T.totpCode('otpauth://totp/x?secret=JBSWY3DPEHPK3PXP&digits=1000'), /Неподдерживаемые/);
+  for (const p of ['Summer2024!!', 'Admin2024Admin', 'Password1234', 'GearPoint2025!']) assert.ok(T.strength(p).level < 3, p);
+  assert.ok(T.strength('correct horse battery staple').level >= 3);
+});
+
 await test('в файлах Dropbox нет ни одного пароля открытым текстом', async () => {
   const all = [...st.files.values()].map(f => f.text).join('\n');
-  for (const s of ['secret-ads', 'pw-Instagram', 'new-2', 'Google Ads', 'Мой банк', 'owner-pass']) {
+  for (const s of ['secret-ads', 'pw-Instagram', 'new-2', 'Google Ads', 'Мой банк', 'owner-pass', 'Реклама']) {
     assert.ok(!all.includes(s), 'нашёлся текст: ' + s);
   }
 });

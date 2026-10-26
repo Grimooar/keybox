@@ -36,17 +36,52 @@ export function generatePassword({ length = 20, lower = true, upper = true, digi
   return chars.slice(0, length).join('');
 }
 
-// Грубая оценка стойкости в битах
+// Оценка стойкости в битах. Считаем пароль так, как его перебирал бы атакующий:
+// кусок букв - вероятно, слово из словаря; год, повторы, «qwerty» и «1234» почти ничего не стоят.
+// Случайная смесь регистров внутри куска оценивается как случайные символы.
+const COMMON = /^(password|passw0rd|qwerty|qwertz|asdf|zxcv|admin|login|welcome|letmein|iloveyou|monkey|dragon|master|secret|summer|winter|spring|autumn|пароль|йцукен|привет|qazwsx|abc)/i;
+const KEYBOARD_ROWS = ['qwertyuiop', 'asdfghjkl', 'zxcvbnm', 'йцукенгшщзхъ', 'фывапролджэ', 'ячсмитьбю', '1234567890'];
+
+function isSequence(s) {
+  const l = s.toLowerCase();
+  if (l.length < 3) return false;
+  if (/^(.)\1+$/.test(l)) return true;
+  const codes = [...l].map(c => c.codePointAt(0));
+  const step = codes[1] - codes[0];
+  if (Math.abs(step) === 1 && codes.every((c, i) => i === 0 || c - codes[i - 1] === step)) return true;
+  return KEYBOARD_ROWS.some(row => row.includes(l) || [...row].reverse().join('').includes(l));
+}
+
+function chunkBits(chunk, seen) {
+  const lower = chunk.toLowerCase();
+  if (seen.has(lower)) return 2; // повтор уже встречавшегося куска
+  seen.add(lower);
+  if (isSequence(chunk)) return 3;
+  if (/^\d+$/.test(chunk)) {
+    if (/^(19|20)\d\d$/.test(chunk)) return 6; // год
+    return chunk.length * Math.log2(10);
+  }
+  if (/^[\p{L}]+$/u.test(chunk)) {
+    const n = [...chunk].length;
+    if (COMMON.test(lower)) return 3 + Math.max(0, n - 6);
+    const capital = chunk[0] !== chunk[0].toLowerCase() ? 1 : 0;
+    // Слово: не дороже ~2^(11+n) вариантов, но и не дороже случайных букв той же длины
+    return Math.min(n * Math.log2(26), 11 + n) + capital;
+  }
+  // Символы: одинаковые подряд стоят как один
+  if (/^(.)\1*$/u.test(chunk)) return chunk === ' ' ? 1 : 5;
+  return [...chunk].length * 5;
+}
+
 export function strength(pw) {
   if (!pw) return { bits: 0, label: '', level: 0 };
-  let pool = 0;
-  if (/[a-z]/.test(pw)) pool += 26;
-  if (/[A-Z]/.test(pw)) pool += 26;
-  if (/\d/.test(pw)) pool += 10;
-  if (/[^a-zA-Z0-9]/.test(pw)) pool += 20;
-  if (/[а-яё]/i.test(pw)) pool += 33;
-  let bits = Math.round(pw.length * Math.log2(Math.max(pool, 2)));
-  if (/^(.)\1+$/.test(pw) || /^(123|qwe|pass|пароль)/i.test(pw)) bits = Math.min(bits, 10);
+  // «GearPoint» = два слова «Gear» + «Point», а не 9 случайных букв
+  const chunks = pw.match(/\p{Lu}?\p{Ll}+|\p{Lu}+(?!\p{Ll})|\d+|[^\p{L}\d]+/gu) || [];
+  const seen = new Set();
+  let bits = 0;
+  for (const c of chunks) bits += chunkBits(c, seen);
+  if (COMMON.test(pw)) bits = Math.min(bits, 20);
+  bits = Math.round(bits);
   const level = bits < 40 ? 1 : bits < 60 ? 2 : bits < 80 ? 3 : 4;
   return { bits, level, label: ['', 'слабый', 'средний', 'хороший', 'отличный'][level] };
 }
@@ -87,6 +122,9 @@ export function parseTotp(input) {
 export async function totpCode(input, now = Date.now()) {
   const p = parseTotp(input);
   if (!p) return null;
+  if (!(p.digits >= 6 && p.digits <= 10 && p.period >= 10 && p.period <= 300) || !['SHA-1', 'SHA-256', 'SHA-512'].includes(p.algorithm)) {
+    throw new Error('Неподдерживаемые параметры 2FA');
+  }
   const key = await crypto.subtle.importKey('raw', base32Decode(p.secret), { name: 'HMAC', hash: p.algorithm }, false, ['sign']);
   const counter = Math.floor(now / 1000 / p.period);
   const msg = new DataView(new ArrayBuffer(8));

@@ -262,17 +262,28 @@ async function screenWho(org) {
     h('button', { class: 'btn link', onclick: () => screenFolder() }, 'Другая папка'));
 }
 
-function screenJoin(org) {
+// Шаг 1: до вступления сверить код команды с владельцем. Иначе подменённый org.json
+// привязал бы новичка к чужой «команде».
+async function screenJoin(org) {
+  const code = await V.teamCode(org);
+  authCard('Вступить в «' + org.name + '»', 'Сначала убедитесь, что это настоящая команда. Попросите владельца открыть раздел «Команда» и назвать код команды.',
+    h('div', { class: 'codes' }, h('div', null, h('span', { class: 'muted' }, 'Код команды'), h('strong', { class: 'code' }, code))),
+    h('button', { class: 'btn primary wide', onclick: () => screenJoinForm(org, code) }, 'Код совпадает'),
+    h('p', { class: 'muted small center' }, 'Не совпадает? Ничего не вводите и сообщите владельцу: файлы команды в Dropbox могли подменить.'),
+    h('button', { class: 'btn link', onclick: () => screenWho(org) }, 'Назад'));
+}
+
+function screenJoinForm(org, teamCode) {
   const name = h('input', { required: true, maxlength: 60, autocomplete: 'name' });
   const mp = masterPasswordFields();
-  authCard('Вступить в «' + org.name + '»', 'Вы создадите свой аккаунт, а владелец или админ команды подтвердит его. Пока ждёте, можно пользоваться личным сейфом.',
+  authCard('Ваш аккаунт', 'Владелец или админ команды подтвердит его. Пока ждёте, можно пользоваться личным сейфом.',
     h('form', {
       onsubmit: e => {
         e.preventDefault();
         const btn = e.currentTarget.querySelector('button[type=submit]');
         run(async () => {
           const password = mp.value();
-          const s = await V.joinTeam(state.storage, { userName: name.value.trim(), password, seen: V.localSeen });
+          const s = await V.joinTeam(state.storage, { userName: name.value.trim(), password, seen: V.localSeen, expectedTeamCode: teamCode });
           LS.set('uid.' + s.orgId, s.me.uid);
           await screenJoined(s);
         }, btn);
@@ -286,11 +297,9 @@ function screenJoin(org) {
 
 async function screenJoined(s) {
   const mine = await s.myCode();
-  const team = await V.teamCode(s.org);
-  authCard('Заявка отправлена', 'Сверьте коды с владельцем или админом команды голосом или в мессенджере. Это защита от подмены.',
+  authCard('Заявка отправлена', 'Назовите этот код админу голосом или в мессенджере. Он примет заявку, только если коды совпадут.',
     h('div', { class: 'codes' },
-      h('div', null, h('span', { class: 'muted' }, 'Ваш код (назовите админу)'), h('strong', { class: 'code' }, mine)),
-      h('div', null, h('span', { class: 'muted' }, 'Код команды (должен совпасть с кодом у владельца)'), h('strong', { class: 'code' }, team))),
+      h('div', null, h('span', { class: 'muted' }, 'Ваш код'), h('strong', { class: 'code' }, mine))),
     h('button', { class: 'btn primary wide', onclick: () => run(() => enter(s)) }, 'Продолжить'));
 }
 
@@ -585,7 +594,8 @@ function renderItem($d) {
   }
   for (const uri of it.uris || []) {
     const href = T.safeUrl(uri);
-    card.append(row('Сайт', h('span', { class: 'ellipsis' }, uri), [
+    // Показываем нормализованный адрес: похожие буквы из других алфавитов видны как xn--…
+    card.append(row('Сайт', h('span', { class: 'ellipsis', title: href || uri }, href || uri), [
       href ? h('a', { class: 'icon-btn', href, target: '_blank', rel: 'noopener noreferrer', title: 'Открыть сайт', 'aria-label': 'Открыть сайт' }, icon('external')) : null,
       iconBtn('copy', 'Копировать адрес', () => copy(uri, 'Адрес скопирован')),
     ]));
@@ -735,7 +745,10 @@ async function renderTeam() {
         canEdit ? iconBtn('trash', 'Удалить из команды', e => run(async () => {
           if (!await confirmDialog('Удалить ' + m.name + '?', 'Человек потеряет доступ, а ключи всех его коллекций сменятся. Не забудьте ещё закрыть ему доступ к папке в самом Dropbox.', 'Удалить', true)) return;
           await s.removeMember(uid);
-          toast('Удалён, ключи коллекций сменены');
+          await modal(m.name + ' удалён из команды', h('div', null,
+            h('p', null, 'Ключи его коллекций сменены, новые записи он не прочитает.'),
+            h('p', { class: 'warn' }, icon('shield'), 'Но пароли, которые он уже видел, он мог запомнить или скопировать. Смените важные пароли на самих сайтах. И закройте ему доступ к папке в Dropbox: «Поделиться» → убрать человека.')),
+          [{ label: 'Понятно', kind: 'primary', value: true }]);
           await s.loadAll(); renderNav(); renderContent();
         }, e.currentTarget)) : null));
   })));
@@ -743,11 +756,13 @@ async function renderTeam() {
   // Коллекции
   body.append(h('div', { class: 'section-head' }, h('h3', null, 'Коллекции'),
     s.isAdmin ? h('button', { class: 'btn small', onclick: () => collectionDialog() }, icon('plus'), 'Новая') : null));
-  body.append(h('div', { class: 'card' }, Object.entries(s.org.collections).sort(([, a], [, b]) => (b.all - a.all) || a.name.localeCompare(b.name, 'ru')).map(([cid, col]) => {
+  // Видны только коллекции, к которым есть ключ (у владельца и админов - все)
+  body.append(h('div', { class: 'card' }, s.collections().filter(c => !c.personal).map(({ cid }) => {
+    const col = s.org.collections[cid];
     const who = col.all ? 'Вся команда' : ['Админы', ...col.members.map(u => s.org.members[u]?.name).filter(Boolean)].join(', ');
     return h('div', { class: 'member' },
       h('span', { class: 'avatar icon-avatar' }, icon(col.all ? 'users' : 'folder')),
-      h('div', { class: 'member-text' }, h('strong', null, col.name), h('span', { class: 'muted small' }, who)),
+      h('div', { class: 'member-text' }, h('strong', null, s.collectionName(cid)), h('span', { class: 'muted small' }, who)),
       s.isAdmin ? h('div', { class: 'member-actions' }, iconBtn('edit', 'Настроить доступ', () => collectionDialog(cid))) : null);
   })));
   if (!s.isAdmin) body.append(h('p', { class: 'muted small' }, 'Менять состав команды и доступы могут владелец и админы.'));
@@ -756,7 +771,7 @@ async function renderTeam() {
 async function approveDialog(p) {
   const s = state.session;
   const restricted = Object.entries(s.org.collections).filter(([, c]) => !c.all);
-  const checks = restricted.map(([cid, c]) => ({ cid, el: h('input', { type: 'checkbox' }), name: c.name }));
+  const checks = restricted.map(([cid]) => ({ cid, el: h('input', { type: 'checkbox' }), name: s.collectionName(cid) }));
   const ok = await modal('Заявка: ' + p.name, h('div', null,
     h('p', null, 'Попросите человека назвать код с его экрана. Принимайте, только если коды совпадают:'),
     h('p', { class: 'code big-code' }, p.code),
@@ -776,8 +791,9 @@ async function approveDialog(p) {
 
 async function collectionDialog(cid) {
   const s = state.session;
-  const col = cid ? s.org.collections[cid] : { name: '', all: false, members: [] };
-  const name = h('input', { value: col.name, maxlength: 60, required: true });
+  const col = cid ? s.org.collections[cid] : { all: false, members: [] };
+  const colName = cid ? s.collectionName(cid) : '';
+  const name = h('input', { value: colName, maxlength: 60, required: true });
   const all = h('input', { type: 'checkbox', checked: col.all });
   const people = Object.entries(s.org.members).filter(([, m]) => m.role === 'member');
   const checks = people.map(([uid, m]) => ({ uid, el: h('input', { type: 'checkbox', checked: col.members.includes(uid) }), name: m.name }));
@@ -792,7 +808,7 @@ async function collectionDialog(cid) {
   if (cid) actions.unshift({
     label: 'Удалить', kind: 'danger ghost', onClick: async () => {
       const n = Object.keys(s.vaults.get(cid)?.items || {}).length;
-      if (!await confirmDialog('Удалить коллекцию «' + col.name + '»?', n ? `Вместе с ней удалятся ${n} записей у всех участников.` : 'Коллекция пустая.', 'Удалить', true)) return false;
+      if (!await confirmDialog('Удалить коллекцию «' + colName + '»?', n ? `Вместе с ней удалятся ${n} записей у всех участников.` : 'Коллекция пустая.', 'Удалить', true)) return false;
       await s.deleteCollection(cid);
       if (state.view === cid) state.view = 'all';
       return true;
@@ -803,7 +819,7 @@ async function collectionDialog(cid) {
       const n = name.value.trim();
       if (!n) throw new Error('Введите название');
       const members = checks.filter(c => c.el.checked).map(c => c.uid);
-      if (cid) await s.updateCollection(cid, { name: n, all: all.checked, members });
+      if (cid) await s.updateCollection(cid, { name: n === colName ? null : n, all: all.checked, members });
       else await s.createCollection(n, all.checked, members);
       return true;
     },

@@ -59,7 +59,7 @@ export function canonical(v) {
 export async function deriveMasterKey(password, kdf) {
   if (kdf.alg !== 'argon2id') throw new CryptoError('Неизвестный алгоритм ключа');
   // Границы, чтобы подменённые параметры не подвесили устройство
-  if (!(kdf.m >= 16384 && kdf.m <= 1048576 && kdf.t >= 1 && kdf.t <= 20 && kdf.p >= 1 && kdf.p <= 8)) {
+  if (!(kdf.m >= 16384 && kdf.m <= 262144 && kdf.t >= 1 && kdf.t <= 10 && kdf.p >= 1 && kdf.p <= 4)) {
     throw new CryptoError('Недопустимые параметры ключа');
   }
   return globalThis.hashwasm.argon2id({

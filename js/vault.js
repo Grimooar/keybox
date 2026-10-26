@@ -22,6 +22,8 @@ export const personalCid = uid => 'p-' + uid;
 const adWrap = (orgId, cid, ver, uid) => `wrap:${orgId}:${cid}:${ver}:${uid}`;
 const adHist = (orgId, cid, ver) => `hist:${orgId}:${cid}:${ver}`;
 const adVault = (orgId, cid, ver) => `vault:${orgId}:${cid}:${ver}`;
+// Название коллекции зашифровано её же ключом: остальные не видят даже, как она называется
+const adName = (orgId, cid, ver) => `name:${orgId}:${cid}:${ver}`;
 const adUser = uid => `user:${uid}`;
 const selfPayload = (f, orgId) => ({ t: 'user', orgId, uid: f.uid, name: f.name, boxPk: f.boxPk, signPk: f.signPk });
 const vaultPayload = (orgId, f) => ({ t: 'vault', orgId, cid: f.cid, keyVersion: f.keyVersion, seq: f.seq, data: f.data, signer: f.signer });
@@ -62,9 +64,10 @@ export function teamCode(org) {
   return memberCode(org.owner.uid, org.members[org.owner.uid]);
 }
 
+// Владелец подписывает оба ключа каждого админа: тогда другой админ не сможет их подменить
 function adminsOf(org) {
   const out = {};
-  for (const [uid, m] of Object.entries(org.members)) if (m.role === 'admin') out[uid] = m.signPk;
+  for (const [uid, m] of Object.entries(org.members)) if (m.role === 'admin') out[uid] = { signPk: m.signPk, boxPk: m.boxPk };
   return out;
 }
 
@@ -81,24 +84,29 @@ export async function verifyOrg(org, pin, seen) {
   if (!org || org.v !== 1 || org.orgId !== pin.orgId) throw fake();
   const owner = org.members?.[org.owner?.uid];
   if (org.owner.signPk !== pin.ownerSignPk || !owner || owner.role !== 'owner' || owner.signPk !== pin.ownerSignPk) throw fake();
+  // Ключи владельца не меняются никогда - админ не может «запереть» владельца
+  if (owner.boxPk !== pin.ownerBoxPk) throw fake();
 
   const c = org.adminCert;
   const cert = { orgId: c?.orgId, certVersion: c?.certVersion, admins: c?.admins };
-  if (c?.orgId !== org.orgId || !await C.verifyObj(pin.ownerSignPk, c.sig, cert)) throw fake();
+  if (c?.orgId !== org.orgId || !c.admins || typeof c.admins !== 'object' || !await C.verifyObj(pin.ownerSignPk, c.sig, cert)) throw fake();
 
-  const signers = { ...c.admins, [org.owner.uid]: pin.ownerSignPk };
-  const signerPk = signers[org.signer];
+  const signers = { [org.owner.uid]: pin.ownerSignPk };
+  for (const [uid, a] of Object.entries(c.admins)) if (uid !== org.owner.uid) signers[uid] = a.signPk;
+  const signerPk = Object.hasOwn(signers, org.signer) ? signers[org.signer] : null;
   const { sig, ...body } = org;
   if (!signerPk || !await C.verifyObj(signerPk, sig, body)) throw fake();
 
   // Роли в файле должны совпадать с сертификатом админов от владельца
   for (const [uid, m] of Object.entries(org.members)) {
     if (!isUid(uid)) throw fake();
-    const certified = c.admins[uid];
-    if (m.role === 'admin' ? certified !== m.signPk : certified !== undefined) throw fake();
+    const certified = Object.hasOwn(c.admins, uid) ? c.admins[uid] : undefined;
+    if (m.role === 'admin'
+      ? certified?.signPk !== m.signPk || certified?.boxPk !== m.boxPk
+      : certified !== undefined) throw fake();
     if (m.role === 'owner' && uid !== org.owner.uid) throw fake();
   }
-  for (const uid of Object.keys(c.admins)) if (!org.members[uid]) throw fake();
+  for (const uid of Object.keys(c.admins)) if (!Object.hasOwn(org.members, uid)) throw fake();
 
   const last = seen?.get(org.orgId);
   if (last && (org.version < last.version || c.certVersion < last.certVersion)) {
@@ -153,7 +161,7 @@ export async function createTeam(storage, { teamName, userName, password, seen }
   const orgId = C.randomHex(16);
   const uid = C.randomHex(16);
   const keys = await C.generateUserKeys();
-  const { file, me } = await makeUser({ uid, name: userName, password, keys, pin: { orgId, ownerSignPk: keys.signPk } });
+  const { file, me } = await makeUser({ uid, name: userName, password, keys, pin: { orgId, ownerSignPk: keys.signPk, ownerBoxPk: keys.boxPk } });
 
   const cert = { orgId, certVersion: 1, admins: {} };
   const cid = C.randomHex(12);
@@ -162,9 +170,11 @@ export async function createTeam(storage, { teamName, userName, password, seen }
     owner: { uid, signPk: keys.signPk },
     adminCert: { ...cert, sig: await C.signObj(me.signSk, cert) },
     members: { [uid]: { name: userName, role: 'owner', boxPk: keys.boxPk, signPk: keys.signPk, addedAt: Date.now() } },
-    collections: { [cid]: { name: 'Общее', all: true, members: [], keyVersion: 1, wraps: {}, history: null } },
+    collections: { [cid]: { all: true, members: [], keyVersion: 1, wraps: {}, history: null } },
   };
-  org.collections[cid].wraps[uid] = await C.sealTo(keys.boxPk, C.randomBytes(32), adWrap(orgId, cid, 1, uid));
+  const key = C.randomBytes(32);
+  org.collections[cid].nameBox = await C.encryptJSON(key, 'Общее', adName(orgId, cid, 1));
+  org.collections[cid].wraps[uid] = await C.sealTo(keys.boxPk, key, adWrap(orgId, cid, 1, uid));
   org.signer = uid;
   org.sig = await C.signObj(me.signSk, org);
 
@@ -182,10 +192,14 @@ export async function createTeam(storage, { teamName, userName, password, seen }
 }
 
 // Заявка на вступление: создаём участника, админ подтверждает её у себя
-export async function joinTeam(storage, { userName, password, seen }) {
+export async function joinTeam(storage, { userName, password, seen, expectedTeamCode }) {
   const r = await readOrg(storage);
   if (!r) throw new VaultError('В этой папке нет команды');
-  const pin = { orgId: r.org.orgId, ownerSignPk: r.org.owner?.signPk };
+  const pin = { orgId: r.org.orgId, ownerSignPk: r.org.owner?.signPk, ownerBoxPk: r.org.members?.[r.org.owner?.uid]?.boxPk };
+  // Пользователь уже сверил этот код с владельцем до вступления (см. экран вступления)
+  if (expectedTeamCode && await teamCode(r.org) !== expectedTeamCode) {
+    throw new VaultError('Файл команды изменился после проверки кода. Сверьте код команды заново.');
+  }
   await verifyOrg(r.org, pin, seen);
   const uid = C.randomHex(16);
   const { file, me } = await makeUser({ uid, name: userName, password, pin });
@@ -224,6 +238,27 @@ export async function listPeople(storage) {
   return people;
 }
 
+const str = v => (typeof v === 'string' ? v : v == null ? '' : String(v));
+
+function normalizeItem(it) {
+  const o = it && typeof it === 'object' ? it : {};
+  return {
+    id: str(o.id),
+    type: o.type === 'note' ? 'note' : 'login',
+    name: str(o.name) || 'Без названия',
+    username: str(o.username),
+    password: str(o.password),
+    uris: Array.isArray(o.uris) ? o.uris.map(str).filter(Boolean) : [],
+    totp: str(o.totp),
+    notes: str(o.notes),
+    favorite: o.favorite === true,
+    history: Array.isArray(o.history) ? o.history.filter(p => p && typeof p === 'object').map(p => ({ password: str(p.password), changedAt: Number(p.changedAt) || 0 })) : [],
+    createdAt: Number(o.createdAt) || 0,
+    updatedAt: Number(o.updatedAt) || 0,
+    updatedBy: str(o.updatedBy),
+  };
+}
+
 // ---------- сессия ----------
 
 export class Session {
@@ -234,6 +269,7 @@ export class Session {
     this.org = null;
     this.orgRev = null;
     this.keys = new Map();   // cid -> { ver, key, old: { ver: key } }
+    this.names = new Map();  // cid -> расшифрованное название
     this.vaults = new Map(); // cid -> { items, rev, error? }
   }
 
@@ -269,6 +305,7 @@ export class Session {
 
   async unwrapKeys() {
     const keys = new Map();
+    const names = new Map();
     if (this.member) {
       for (const [cid, col] of Object.entries(this.org.collections)) {
         const w = col.wraps[this.me.uid];
@@ -280,23 +317,26 @@ export class Session {
           for (const [v, k] of Object.entries(h)) old[v] = C.b64d(k);
         }
         keys.set(cid, { ver: col.keyVersion, key, old });
+        names.set(cid, String(await C.decryptJSON(key, col.nameBox, adName(this.orgId, cid, col.keyVersion))));
       }
     }
     this.keys = keys;
+    this.names = names;
   }
 
   // Коллекции, к которым у меня есть доступ
   collections() {
     const list = [];
     for (const [cid, col] of Object.entries(this.org?.collections || {})) {
-      if (this.keys.has(cid)) list.push({ cid, name: col.name, all: col.all });
+      if (this.keys.has(cid)) list.push({ cid, name: this.names.get(cid), all: col.all });
     }
     list.sort((a, b) => (b.all - a.all) || a.name.localeCompare(b.name, 'ru'));
     return [{ cid: this.personalCid, name: 'Личное', personal: true }, ...list];
   }
 
   collectionName(cid) {
-    return cid === this.personalCid ? 'Личное' : this.org.collections[cid]?.name || '?';
+    if (cid === this.personalCid) return 'Личное';
+    return this.names.get(cid) || 'Закрытая коллекция';
   }
 
   currentKey(cid) {
@@ -314,31 +354,41 @@ export class Session {
   }
 
   // Кто вправе записывать коллекцию: личную - только я, общую - те, у кого есть к ней доступ
-  writerPk(cid, uid) {
+  writerPk(cid, uid, org = this.org) {
     if (cid === this.personalCid) return uid === this.me.uid ? this.me.signPk : null;
-    const col = this.org.collections[cid];
-    if (!col || !isUid(uid) || !accessOf(this.org, col).includes(uid)) return null;
-    return this.org.members[uid].signPk;
+    const col = org.collections[cid];
+    if (!col || !isUid(uid) || !accessOf(org, col).includes(uid)) return null;
+    return org.members[uid].signPk;
   }
 
-  async readVault(cid) {
+  // asOrg - проверять подпись по этому составу команды (нужно при смене ключа после удаления автора)
+  async readVault(cid, asOrg = this.org) {
+    const seenKey = this.orgId + ':' + cid;
+    const last = this.seen.get(seenKey);
     const r = await this.s.read(vaultPath(cid));
-    if (!r) return { items: {}, rev: null, seq: 0 };
+    if (!r) {
+      // Файла нет, а устройство уже видело записи - значит, его удалили, а не «коллекция пустая»
+      if (last?.seq > 0) throw new VaultError('Файл коллекции «' + this.collectionName(cid) + '» пропал из Dropbox. Восстановите его из удалённых файлов Dropbox.');
+      return { items: {}, rev: null, seq: 0 };
+    }
     const f = JSON.parse(r.text);
     if (f.cid !== cid) throw new VaultError('Файл коллекции подменён');
     // Подпись автора: без неё бывший участник, знающий старый ключ, мог бы подложить свои записи
-    const pk = this.writerPk(cid, f.signer);
+    const pk = this.writerPk(cid, f.signer, asOrg);
     if (!pk || !Number.isInteger(f.seq) || !await C.verifyObj(pk, f.sig, vaultPayload(this.orgId, f))) {
       throw new VaultError('Файл коллекции «' + this.collectionName(cid) + '» подписан не участником с доступом. Восстановите прошлую версию в Dropbox.');
     }
-    const seenKey = this.orgId + ':' + cid;
-    const last = this.seen.get(seenKey);
     if (last && f.seq < last.seq) {
       throw new VaultError('В Dropbox лежит более старая версия коллекции «' + this.collectionName(cid) + '», чем это устройство уже видело.');
     }
     const { items } = await C.decryptJSON(this.keyFor(cid, f.keyVersion), f.data, adVault(this.orgId, cid, f.keyVersion));
-    this.seen.set(seenKey, { seq: f.seq });
+    this.bumpVaultSeen(cid, f.seq);
     return { items, rev: r.rev, seq: f.seq };
+  }
+
+  bumpVaultSeen(cid, seq) {
+    const key = this.orgId + ':' + cid;
+    this.seen.set(key, { seq: Math.max(this.seen.get(key)?.seq || 0, seq) });
   }
 
   async loadAll() {
@@ -353,9 +403,10 @@ export class Session {
     for (const cid of [...this.vaults.keys()]) if (!cols.some(c => c.cid === cid)) this.vaults.delete(cid);
   }
 
+  // Записи пишут другие участники - приводим поля к ожидаемым типам, чтобы кривая запись не роняла интерфейс
   allItems() {
     const out = [];
-    for (const [cid, v] of this.vaults) for (const item of Object.values(v.items)) out.push({ ...item, cid });
+    for (const [cid, v] of this.vaults) for (const item of Object.values(v.items)) out.push({ ...normalizeItem(item), cid });
     return out;
   }
 
@@ -370,16 +421,8 @@ export class Session {
         throw e;
       }
       const res = await mutate(v.items);
-      const { ver, key } = this.currentKey(cid);
-      const file = {
-        v: 1, cid, keyVersion: ver, seq: v.seq + 1, signer: this.me.uid,
-        data: await C.encryptJSON(key, { items: v.items }, adVault(this.orgId, cid, ver)),
-      };
-      file.sig = await C.signObj(this.me.signSk, vaultPayload(this.orgId, file));
       try {
-        const rev = await this.s.write(vaultPath(cid), JSON.stringify(file), v.rev);
-        this.seen.set(this.orgId + ':' + cid, { seq: file.seq });
-        this.vaults.set(cid, { items: v.items, rev, seq: file.seq });
+        await this.writeVault(cid, v);
         return res;
       } catch (e) {
         if (!(e instanceof ConflictError)) throw e;
@@ -387,6 +430,19 @@ export class Session {
       }
     }
     throw new VaultError('Не удалось сохранить: коллекцию постоянно меняют, попробуйте ещё раз');
+  }
+
+  // Записать коллекцию текущим ключом и своей подписью поверх версии v.rev
+  async writeVault(cid, v) {
+    const { ver, key } = this.currentKey(cid);
+    const file = {
+      v: 1, cid, keyVersion: ver, seq: v.seq + 1, signer: this.me.uid,
+      data: await C.encryptJSON(key, { items: v.items }, adVault(this.orgId, cid, ver)),
+    };
+    file.sig = await C.signObj(this.me.signSk, vaultPayload(this.orgId, file));
+    const rev = await this.s.write(vaultPath(cid), JSON.stringify(file), v.rev);
+    this.bumpVaultSeen(cid, file.seq);
+    this.vaults.set(cid, { items: v.items, rev, seq: file.seq });
   }
 
   // ---------- записи ----------
@@ -454,6 +510,13 @@ export class Session {
       delete d.sig;
       d.sig = await C.signObj(this.me.signSk, d);
 
+      // Записи коллекций со сменой ключа читаем ДО записи нового состава: последним их мог
+      // подписать как раз тот, у кого сейчас забирают доступ, и по новому составу подпись не пройдёт.
+      const pre = {};
+      for (const cid of rotated) {
+        try { pre[cid] = await this.readVault(cid); } catch (e) { pre[cid] = null; console.warn(e); }
+      }
+
       try {
         this.orgRev = await this.s.write(ORG, JSON.stringify(d, null, 1), this.orgRev);
       } catch (e) {
@@ -463,8 +526,16 @@ export class Session {
       this.org = d;
       this.bumpSeen();
       await this.unwrapKeys();
-      // Перешифровать записи новым ключом (старый ключ хранится в истории коллекции)
-      for (const cid of rotated) await this.updateVault(cid, () => {});
+      // Перешифровать записи новым ключом и переподписать (старый ключ хранится в истории коллекции)
+      for (const cid of rotated) {
+        if (!pre[cid]) continue; // файл и так был повреждён - оставляем как есть, ошибка видна в интерфейсе
+        try {
+          await this.writeVault(cid, pre[cid]);
+        } catch (e) {
+          if (!(e instanceof ConflictError)) throw e;
+          await this.updateVault(cid, () => {});
+        }
+      }
       return res;
     }
     throw new VaultError('Не удалось сохранить: файл команды постоянно меняют, попробуйте ещё раз');
@@ -473,13 +544,14 @@ export class Session {
   async wrapFor(d, cid, uid) {
     const col = d.collections[cid];
     const k = this.keys.get(cid);
-    if (!k || k.ver !== col.keyVersion) throw new VaultError('Нет актуального ключа коллекции «' + col.name + '»');
+    if (!k || k.ver !== col.keyVersion) throw new VaultError('Нет актуального ключа коллекции «' + this.collectionName(cid) + '»');
     col.wraps[uid] = await C.sealTo(d.members[uid].boxPk, k.key, adWrap(d.orgId, cid, col.keyVersion, uid));
   }
 
-  // Выдать ключ всем, у кого есть доступ. old - прошлые версии ключа.
-  async rekey(d, cid, key, old) {
+  // Новый ключ коллекции: название, история старых ключей и выдача всем, у кого есть доступ
+  async rekey(d, cid, key, old, name) {
     const col = d.collections[cid];
+    col.nameBox = await C.encryptJSON(key, name, adName(d.orgId, cid, col.keyVersion));
     const hist = Object.fromEntries(Object.entries(old).map(([v, k]) => [v, C.b64e(k)]));
     col.history = Object.keys(hist).length ? await C.encryptJSON(key, hist, adHist(d.orgId, cid, col.keyVersion)) : null;
     col.wraps = {};
@@ -493,9 +565,11 @@ export class Session {
     const after = accessOf(d, col);
     if (before.some(uid => !after.includes(uid))) {
       const k = this.keys.get(cid);
-      if (!k || k.ver !== col.keyVersion) throw new VaultError('Нет актуального ключа коллекции «' + col.name + '»');
+      if (!k || k.ver !== col.keyVersion) throw new VaultError('Нет актуального ключа коллекции «' + this.collectionName(cid) + '»');
+      // Название берём из d: его могли переименовать в этом же изменении
+      const name = await C.decryptJSON(k.key, col.nameBox, adName(d.orgId, cid, col.keyVersion));
       col.keyVersion += 1;
-      await this.rekey(d, cid, C.randomBytes(32), { ...k.old, [k.ver]: k.key });
+      await this.rekey(d, cid, C.randomBytes(32), { ...k.old, [k.ver]: k.key }, name);
       return true;
     }
     for (const uid of after) if (!col.wraps[uid]) await this.wrapFor(d, cid, uid);
@@ -559,26 +633,31 @@ export class Session {
   async setRole(uid, role) {
     if (!this.isOwner) throw new VaultError('Менять роли может только владелец');
     if (!['admin', 'member'].includes(role)) throw new VaultError('Неизвестная роль');
-    if (this.org.members[uid]?.role === 'owner') throw new VaultError('Роль владельца не меняется');
+    checkUid(uid);
+    if (!Object.hasOwn(this.org.members, uid)) throw new VaultError('Участник не найден');
+    if (this.org.members[uid].role === 'owner') throw new VaultError('Роль владельца не меняется');
     await this.updateOrg(d => { d.members[uid].role = role; });
   }
 
   async createCollection(name, all, members = []) {
     const cid = C.randomHex(12);
     await this.updateOrg(async d => {
-      d.collections[cid] = { name, all: !!all, members: all ? [] : members.filter(u => d.members[u]), keyVersion: 1, wraps: {}, history: null };
-      await this.rekey(d, cid, C.randomBytes(32), {});
+      d.collections[cid] = { all: !!all, members: all ? [] : members.filter(u => isUid(u) && Object.hasOwn(d.members, u)), keyVersion: 1, wraps: {}, history: null };
+      await this.rekey(d, cid, C.randomBytes(32), {}, String(name));
     });
     return cid;
   }
 
   updateCollection(cid, { name, all, members }) {
-    return this.updateOrg(d => {
-      const col = d.collections[cid];
+    return this.updateOrg(async d => {
+      const col = Object.hasOwn(d.collections, cid) ? d.collections[cid] : null;
       if (!col) throw new VaultError('Коллекция не найдена');
-      if (name != null) col.name = name;
+      if (name != null) {
+        const k = this.currentKey(cid);
+        col.nameBox = await C.encryptJSON(k.key, String(name), adName(d.orgId, cid, col.keyVersion));
+      }
       if (all != null) col.all = !!all;
-      if (members) col.members = col.all ? [] : members.filter(u => d.members[u]);
+      if (members) col.members = col.all ? [] : members.filter(u => isUid(u) && Object.hasOwn(d.members, u));
     });
   }
 
