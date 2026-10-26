@@ -1,10 +1,10 @@
 // Офлайн-оболочка: файлы приложения берём из сети, а без сети - из кэша.
 // Запросы к Dropbox не кэшируются здесь (их зашифрованный кэш ведёт само приложение).
 
-const CACHE = 'keybox-v3';
+const CACHE = 'keybox-v4';
 const FILES = [
   './', 'index.html', 'manifest.webmanifest', 'css/app.css',
-  'js/app.js', 'js/config.js', 'js/crypto.js', 'js/dropbox-auth.js', 'js/storage.js', 'js/tools.js', 'js/ui.js', 'js/vault.js',
+  'js/app.js', 'js/config.js', 'js/crypto.js', 'js/storage.js', 'js/tools.js', 'js/ui.js', 'js/vault.js',
   'vendor/argon2.umd.min.js', 'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png',
 ];
 

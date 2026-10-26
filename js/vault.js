@@ -38,6 +38,7 @@ function checkUid(uid) {
 const RETRIES = 6;
 
 export class VaultError extends Error {}
+export class RemovedError extends VaultError {}
 
 // Последние виденные версии org.json - защита от отката к старому файлу
 export const localSeen = {
@@ -117,7 +118,6 @@ export async function verifyOrg(org, pin, seen) {
 async function makeUser({ uid, name, password, pin, keys }) {
   keys = keys || await C.generateUserKeys();
   const kdf = C.newKdf();
-  const master = await C.deriveMasterKey(password, kdf);
   const secret = {
     boxPk: keys.boxPk, signPk: keys.signPk,
     boxSk: keys.boxSk, signSk: keys.signSk,
@@ -127,8 +127,47 @@ async function makeUser({ uid, name, password, pin, keys }) {
   const file = { v: 1, uid, name, boxPk: keys.boxPk, signPk: keys.signPk, kdf, createdAt: Date.now() };
   const me = await meFromSecret(uid, name, secret);
   file.selfSig = await C.signObj(me.signSk, selfPayload(file, pin.orgId));
-  file.secret = await C.encryptJSON(master, secret, adUser(uid));
+  await sealSecret(file, password, secret);
   return { file, me };
+}
+
+// Зашифровать ключи участника мастер-паролем. authHash сервер хранит отдельно
+// и по нему пускает к файлу - так чужие не могут скачать его и перебирать пароль.
+async function sealSecret(file, password, secret) {
+  const sub = await C.masterSubkeys(await C.deriveMasterKey(password, file.kdf));
+  file.secret = await C.encryptJSON(sub.enc, secret, adUser(file.uid));
+  file.authHash = await C.sha256b64(sub.auth);
+}
+
+// Вход: на сервере - по проверке пароля, в остальных хранилищах - просто читаем файл
+async function loginFile(storage, uid, password) {
+  checkUid(uid);
+  let kdf, r;
+  if (storage.prelogin) {
+    kdf = (await storage.prelogin(uid)).kdf;
+  } else {
+    r = await storage.read(userPath(uid));
+    if (!r) throw new VaultError('Участник не найден. Возможно, его удалили из команды.');
+    kdf = JSON.parse(r.text).kdf;
+  }
+  const sub = await C.masterSubkeys(await C.deriveMasterKey(password, kdf));
+  if (storage.login) {
+    try {
+      r = await storage.login(uid, sub.auth);
+    } catch (e) {
+      if (e.status === 401) throw new VaultError('Неверный мастер-пароль');
+      throw e;
+    }
+  }
+  const file = JSON.parse(r.text);
+  if (file.uid !== uid) throw new VaultError('Файл участника подменён');
+  let secret;
+  try {
+    secret = await C.decryptJSON(sub.enc, file.secret, adUser(uid));
+  } catch {
+    throw new VaultError('Неверный мастер-пароль');
+  }
+  return meFromSecret(uid, file.name, secret);
 }
 
 async function meFromSecret(uid, name, secret) {
@@ -143,21 +182,11 @@ async function meFromSecret(uid, name, secret) {
   };
 }
 
-async function openUser(file, password) {
-  const master = await C.deriveMasterKey(password, file.kdf);
-  let secret;
-  try {
-    secret = await C.decryptJSON(master, file.secret, adUser(file.uid));
-  } catch {
-    throw new VaultError('Неверный мастер-пароль');
-  }
-  return meFromSecret(file.uid, file.name, secret);
-}
-
 // ---------- вход ----------
 
-export async function createTeam(storage, { teamName, userName, password, seen }) {
-  if (await storage.read(ORG)) throw new VaultError('В этой папке уже есть команда');
+// setup - для сервера: код установки и хэш секрета команды
+export async function createTeam(storage, { teamName, userName, password, seen, setup }) {
+  if (!setup && await storage.read(ORG)) throw new VaultError('Команда уже создана');
   const orgId = C.randomHex(16);
   const uid = C.randomHex(16);
   const keys = await C.generateUserKeys();
@@ -178,13 +207,18 @@ export async function createTeam(storage, { teamName, userName, password, seen }
   org.signer = uid;
   org.sig = await C.signObj(me.signSk, org);
 
-  await storage.write(userPath(uid), JSON.stringify(file, null, 1), null);
-  try {
-    await storage.write(ORG, JSON.stringify(org, null, 1), null);
-  } catch (e) {
-    await storage.remove(userPath(uid)).catch(() => {});
-    if (e instanceof ConflictError) throw new VaultError('В этой папке уже есть команда');
-    throw e;
+  if (setup) {
+    // Сервер создаёт всё одним запросом и сам проверяет подписи
+    await storage.setup({ ...setup, user: JSON.stringify(file), org: JSON.stringify(org, null, 1) });
+  } else {
+    await storage.write(userPath(uid), JSON.stringify(file, null, 1), null);
+    try {
+      await storage.write(ORG, JSON.stringify(org, null, 1), null);
+    } catch (e) {
+      await storage.remove(userPath(uid)).catch(() => {});
+      if (e instanceof ConflictError) throw new VaultError('Команда уже создана');
+      throw e;
+    }
   }
   const s = new Session(storage, me, seen);
   await s.refresh();
@@ -210,9 +244,7 @@ export async function joinTeam(storage, { userName, password, seen, expectedTeam
 }
 
 export async function unlock(storage, uid, password, seen) {
-  const r = await storage.read(userPath(checkUid(uid)));
-  if (!r) throw new VaultError('Участник не найден. Возможно, его удалили из команды.');
-  const me = await openUser(JSON.parse(r.text), password);
+  const me = await loginFile(storage, uid, password);
   const s = new Session(storage, me, seen);
   await s.refresh();
   return s;
@@ -220,6 +252,7 @@ export async function unlock(storage, uid, password, seen) {
 
 // Список людей для экрана входа (без расшифровки)
 export async function listPeople(storage) {
+  if (storage.people) return storage.people();
   const r = await readOrg(storage);
   const people = [];
   const seenUids = new Set();
@@ -264,6 +297,7 @@ function normalizeItem(it) {
 export class Session {
   constructor(storage, me, seen) {
     this.s = storage;
+    this.s.authenticate?.(me.uid, me.signSk); // дальше все запросы к серверу подписываются
     this.me = me;
     this.seen = seen;
     this.org = null;
@@ -285,7 +319,8 @@ export class Session {
     const r = await readOrg(this.s);
     if (!r) throw new VaultError('Файл команды не найден в папке Dropbox');
     await verifyOrg(r.org, this.me.pin, this.seen);
-    const m = r.org.members[this.me.uid];
+    const m = Object.hasOwn(r.org.members, this.me.uid) ? r.org.members[this.me.uid] : null;
+    if (this.member && !m) throw new RemovedError('Вас удалили из команды. Данные команды больше недоступны.');
     if (m && (m.boxPk !== this.me.boxPk || m.signPk !== this.me.signPk)) {
       throw new VaultError('Ваши ключи в файле команды не совпадают с вашими. Попросите админа заново добавить вас.');
     }
@@ -670,8 +705,7 @@ export class Session {
   // ---------- мои настройки ----------
 
   async checkPassword(password) {
-    const r = await this.s.read(userPath(this.me.uid));
-    await openUser(JSON.parse(r.text), password);
+    await loginFile(this.s, this.me.uid, password);
   }
 
   async changePassword(newPassword) {
@@ -679,7 +713,7 @@ export class Session {
       const r = await this.s.read(userPath(this.me.uid));
       const f = JSON.parse(r.text);
       f.kdf = C.newKdf();
-      f.secret = await C.encryptJSON(await C.deriveMasterKey(newPassword, f.kdf), this.me.secret, adUser(this.me.uid));
+      await sealSecret(f, newPassword, this.me.secret);
       try {
         await this.s.write(userPath(this.me.uid), JSON.stringify(f, null, 1), r.rev);
         return;

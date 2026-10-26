@@ -50,7 +50,7 @@ await test('владелец создаёт команду с коллекцие
   general = cols.find(c => c.all).cid;
   await owner.saveItem(general, item('Instagram'));
   await owner.saveItem(owner.personalCid, item('Личная почта'));
-  await rejects(V.createTeam(st, { teamName: 'X', userName: 'Y', password: 'z', seen: dev() }), /уже есть команда/);
+  await rejects(V.createTeam(st, { teamName: 'X', userName: 'Y', password: 'z', seen: dev() }), /Команда уже создана/);
 });
 
 await test('неверный мастер-пароль не пускает', async () => {
@@ -157,8 +157,7 @@ await test('удаление участника: ключ коллекции м�
   // Записи на месте и читаются новым ключом
   await owner.loadAll();
   assert.ok(owner.allItems().some(i => i.name === 'Google Ads'));
-  await bob.refresh();
-  assert.ok(bob.pending);
+  await rejects(bob.refresh(), /Вас удалили из команды/);
   await rejects(V.unlock(st, bob.me.uid, 'bob-pass', dev()), /не найден/);
 });
 

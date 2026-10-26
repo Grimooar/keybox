@@ -1,9 +1,8 @@
 // Ключница - интерфейс приложения
 
-import { DROPBOX_APP_KEY, DEFAULT_FOLDER, APP_VERSION } from './config.js';
+import { API_URL, APP_VERSION } from './config.js';
 import * as C from './crypto.js';
-import { DropboxAuth, redirectUri } from './dropbox-auth.js';
-import { DropboxStorage, CachedStorage, MemoryStorage } from './storage.js';
+import { ApiStorage, ApiError, CachedStorage, MemoryStorage, NetworkError } from './storage.js';
 import * as V from './vault.js';
 import * as T from './tools.js';
 import { h, icon, iconBtn, clear, toast, modal, confirmDialog, field, formatDate, avatar } from './ui.js';
@@ -17,8 +16,9 @@ const LS = {
 };
 
 const state = {
-  auth: null,
   storage: null,
+  team: null,           // { secret, code } из ссылки команды
+  demo: false,
   session: null,
   orgName: '',
   view: 'all',          // all | fav | <cid> | team | settings | generator
@@ -49,7 +49,8 @@ async function run(fn, btn) {
 }
 
 let clipTimer = null;
-async function copy(text, what = 'Скопировано') {
+// secret = false - для ссылок и адресов: их не стираем из буфера
+async function copy(text, what = 'Скопировано', secret = true) {
   if (!text) return;
   try {
     await navigator.clipboard.writeText(text);
@@ -57,6 +58,7 @@ async function copy(text, what = 'Скопировано') {
     toast('Не удалось скопировать', 'error');
     return;
   }
+  if (!secret) return toast(what);
   toast(what + '. Буфер очистится через 30 с');
   clearTimeout(clipTimer);
   clipTimer = setTimeout(async () => {
@@ -139,72 +141,66 @@ async function start() {
   if (!await C.checkSupport()) return screenUnsupported();
   // Тестовый режим для разработки: только localhost, данные в памяти вкладки
   if (location.hash === '#demo' && ['localhost', '127.0.0.1'].includes(location.hostname)) {
-    state.auth = { disconnect: async () => {} };
+    state.demo = true;
     state.storage ||= new MemoryStorage();
-    LS.set('folder', '/Демо');
     return screenEntry();
   }
-  const appKey = DROPBOX_APP_KEY || LS.get('appKey');
-  if (!appKey) return screenAppKey();
-  state.auth = new DropboxAuth(appKey);
-  try {
-    if (await state.auth.handleRedirect()) toast('Dropbox подключён');
-  } catch (e) {
-    toast(e.message, 'error');
-  }
-  if (!state.auth.connected) return screenConnect();
-  const folder = LS.get('folder');
-  if (!folder) return screenFolder();
-  state.storage = new CachedStorage(new DropboxStorage(state.auth, folder), folder.toLowerCase());
+  readLink();
+  state.team = LS.get('team');
+  const setupCode = sessionGet('setup');
+  if (setupCode && !state.team) return screenCreateTeam(setupCode);
+  if (!state.team) return screenNoTeam();
+  state.storage = new CachedStorage(new ApiStorage(API_URL, state.team.secret), 'team');
+  state.storage.invite = sessionGet('invite');
   return screenEntry();
+}
+
+function sessionGet(k) { try { return sessionStorage.getItem('kb.' + k); } catch { return null; } }
+function sessionSet(k, v) { try { v == null ? sessionStorage.removeItem('kb.' + k) : sessionStorage.setItem('kb.' + k, v); } catch { /* нет доступа */ } }
+
+const codeDigits = code => String(code || '').replace(/\D/g, '');
+
+// Ссылки (всё после #, на сервер GitHub это не уходит):
+//   #setup=<код>                        - создать команду (один раз, ссылку даёт установщик)
+//   #t=<секрет команды>&c=<код команды> - вход в команду с нового устройства
+//   ...&i=<приглашение>                 - то же + заявка на вступление
+function readLink() {
+  const p = new URLSearchParams(location.hash.slice(1));
+  if (!p.has('setup') && !p.has('t')) return;
+  history.replaceState(null, '', location.pathname); // секреты не остаются в адресной строке
+  if (p.has('setup')) sessionSet('setup', p.get('setup'));
+  if (p.has('t')) {
+    const team = { secret: p.get('t'), code: codeDigits(p.get('c')) };
+    const cur = LS.get('team');
+    if (cur && cur.secret !== team.secret) forgetDevice();
+    LS.set('team', team);
+  }
+  if (p.has('i')) sessionSet('invite', p.get('i'));
+}
+
+function teamLink(invite) {
+  const p = new URLSearchParams({ t: state.team.secret, c: state.team.code });
+  if (invite) p.set('i', invite);
+  return location.origin + location.pathname + '#' + p;
+}
+
+function forgetDevice() {
+  try {
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const k = localStorage.key(i);
+      if (k?.startsWith('kb.') && !k.startsWith('kb.gen') && !k.startsWith('kb.lockMin')) localStorage.removeItem(k);
+    }
+  } catch { /* нет доступа */ }
+  sessionSet('invite', null);
 }
 
 function screenUnsupported() {
   authCard('Браузер устарел', 'Нужен свежий Chrome, Edge, Safari 17+ или Firefox 130+: в старых нет нужного шифрования.');
 }
 
-function screenAppKey() {
-  const input = h('input', { placeholder: 'например, a1b2c3d4e5f6g7h', spellcheck: 'false', autocomplete: 'off' });
-  const uri = redirectUri();
-  authCard('Подключение к Dropbox', 'Один раз нужно создать своё приложение Dropbox. Это бесплатно и займёт 2 минуты.',
-    h('ol', { class: 'steps' },
-      h('li', null, 'Откройте ', h('a', { href: 'https://www.dropbox.com/developers/apps/create', target: '_blank', rel: 'noopener noreferrer' }, 'dropbox.com/developers/apps'), ' → Create app.'),
-      h('li', null, 'Выберите «Scoped access» и «Full Dropbox», придумайте любое имя.'),
-      h('li', null, 'На вкладке Permissions включите files.metadata.read, files.content.read, files.content.write и нажмите Submit.'),
-      h('li', null, 'На вкладке Settings в «Redirect URIs» добавьте адрес:', h('div', { class: 'code-row' }, h('code', null, uri), iconBtn('copy', 'Скопировать', () => copy(uri, 'Адрес скопирован')))),
-      h('li', null, 'Скопируйте оттуда же App key и вставьте сюда.')),
-    h('form', {
-      onsubmit: e => {
-        e.preventDefault();
-        const v = input.value.trim();
-        if (!/^[a-z0-9]{8,32}$/i.test(v)) return toast('Похоже, это не App key', 'error');
-        LS.set('appKey', v);
-        start();
-      },
-    }, field('App key', input), h('button', { class: 'btn primary wide' }, 'Сохранить')));
-}
-
-function screenConnect() {
-  authCard('Подключите Dropbox', 'Пароли будут лежать в вашем Dropbox в зашифрованном виде. Ни Dropbox, ни кто-то ещё не сможет их прочитать.',
-    h('button', { class: 'btn primary wide', onclick: e => run(() => state.auth.begin(), e.currentTarget) }, 'Подключить Dropbox'),
-    DROPBOX_APP_KEY ? null : h('button', { class: 'btn link', onclick: () => { LS.del('appKey'); start(); } }, 'Сменить App key'));
-}
-
-function screenFolder() {
-  const input = h('input', { value: LS.get('folder') || DEFAULT_FOLDER, spellcheck: 'false' });
-  authCard('Папка в Dropbox', 'Где хранить данные.',
-    h('form', {
-      onsubmit: e => {
-        e.preventDefault();
-        const v = '/' + input.value.trim().replace(/^\/+|\/+$/g, '');
-        if (v === '/') return toast('Укажите папку', 'error');
-        LS.set('folder', v);
-        start();
-      },
-    },
-    field('Путь к папке', input, 'Для команды: создайте эту папку в Dropbox и поделитесь ею с коллегами (кнопка «Поделиться»). У них она появится в их Dropbox. Каждый указывает здесь путь, под которым папка видна у него.'),
-    h('button', { class: 'btn primary wide' }, 'Продолжить')),
-    h('button', { class: 'btn link', onclick: () => run(async () => { await state.auth.disconnect(); start(); }) }, 'Отключить Dropbox'));
+function screenNoTeam(message) {
+  authCard('Нужна ссылка команды', message || 'Ключница открывается по ссылке от владельца или админа команды. Попросите её: раздел «Команда» → «Пригласить».',
+    h('p', { class: 'muted small' }, 'Если вы уже в команде и открыли Ключницу на новом устройстве, возьмите ссылку на старом: «Настройки» → «Вход с другого устройства».'));
 }
 
 async function screenEntry() {
@@ -213,22 +209,32 @@ async function screenEntry() {
   try {
     r = await V.readOrg(state.storage);
   } catch (e) {
-    return authCard('Нет связи с Dropbox', e.message,
-      h('button', { class: 'btn primary wide', onclick: () => screenEntry() }, 'Повторить'),
-      h('button', { class: 'btn link', onclick: () => screenFolder() }, 'Другая папка'));
+    if (e instanceof ApiError && e.status === 403) {
+      return screenNoTeam('Эта ссылка команды больше не действует. Попросите у админа новую.');
+    }
+    if (e instanceof ApiError && e.status === 404 && !state.demo) return screenNoTeam('Команда на сервере ещё не создана.');
+    return authCard('Нет связи с сервером', e instanceof NetworkError ? 'Проверьте интернет и попробуйте ещё раз.' : e.message,
+      h('button', { class: 'btn primary wide', onclick: () => screenEntry() }, 'Повторить'));
   }
-  if (!r) return screenCreateTeam();
+  if (!r) return state.demo ? screenCreateTeam(null) : screenNoTeam();
+  // Код команды из ссылки - защита от подмены: сервер не может выдать чужую «команду»
+  const code = await V.teamCode(r.org);
+  if (!state.demo && state.team.code && codeDigits(code) !== state.team.code) {
+    return authCard('Ссылка не совпадает с командой', 'Код команды на сервере не тот, что в вашей ссылке. Ничего не вводите и сообщите владельцу.',
+      h('button', { class: 'btn link', onclick: () => { forgetDevice(); start(); } }, 'Забыть эту ссылку'));
+  }
   state.orgName = r.org.name;
+  if (state.storage.invite) return screenJoinForm(r.org);
   const uid = LS.get('uid.' + r.org.orgId);
   if (uid) return screenUnlock(uid, r.org);
   return screenWho(r.org);
 }
 
-function screenCreateTeam() {
+function screenCreateTeam(setupCode) {
   const team = h('input', { required: true, placeholder: 'например, GearPoint', maxlength: 60 });
   const name = h('input', { required: true, placeholder: 'как вас будут видеть коллеги', maxlength: 60, autocomplete: 'name' });
   const mp = masterPasswordFields();
-  authCard('Новая команда', `В папке ${LS.get('folder')} ещё ничего нет. Создайте команду, вы будете её владельцем.`,
+  authCard('Новая команда', 'Создайте команду, вы будете её владельцем. Потом пригласите коллег ссылкой.',
     h('form', {
       onsubmit: e => {
         e.preventDefault();
@@ -236,7 +242,19 @@ function screenCreateTeam() {
         run(async () => {
           const password = mp.value();
           btn.textContent = 'Создаю ключи…';
-          const s = await V.createTeam(state.storage, { teamName: team.value.trim(), userName: name.value.trim(), password, seen: V.localSeen });
+          let setup = null;
+          if (!state.demo) {
+            const secret = C.b64e(C.randomBytes(24));
+            state.storage = new CachedStorage(new ApiStorage(API_URL, secret), 'team');
+            setup = { setupCode, teamHash: await C.sha256b64(secret) };
+            state.team = { secret };
+          }
+          const s = await V.createTeam(state.storage, { teamName: team.value.trim(), userName: name.value.trim(), password, seen: V.localSeen, setup });
+          if (!state.demo) {
+            state.team.code = codeDigits(await V.teamCode(s.org));
+            LS.set('team', state.team);
+            sessionSet('setup', null);
+          }
           LS.set('uid.' + s.orgId, s.me.uid);
           await enter(s);
           toast('Команда создана');
@@ -246,8 +264,7 @@ function screenCreateTeam() {
     field('Название команды', team),
     field('Ваше имя', name),
     ...mp.els,
-    h('button', { class: 'btn primary wide', type: 'submit' }, 'Создать команду')),
-    h('button', { class: 'btn link', onclick: () => screenFolder() }, 'Другая папка'));
+    h('button', { class: 'btn primary wide', type: 'submit' }, 'Создать команду')));
 }
 
 async function screenWho(org) {
@@ -258,32 +275,24 @@ async function screenWho(org) {
     h('div', { class: 'people' }, people.map(p =>
       h('button', { class: 'person', onclick: () => screenUnlock(p.uid, org) },
         avatar(p.name), h('span', { class: 'person-name' }, p.name), roles[p.role] ? h('span', { class: 'tag' }, roles[p.role]) : null))),
-    h('button', { class: 'btn primary wide', onclick: () => screenJoin(org) }, icon('plus'), 'Я новый участник'),
-    h('button', { class: 'btn link', onclick: () => screenFolder() }, 'Другая папка'));
+    state.demo
+      ? h('button', { class: 'btn primary wide', onclick: () => screenJoinForm(org) }, icon('plus'), 'Я новый участник')
+      : h('p', { class: 'muted small center' }, 'Новенький? Попросите у админа ссылку-приглашение.'));
 }
 
-// Шаг 1: до вступления сверить код команды с владельцем. Иначе подменённый org.json
-// привязал бы новичка к чужой «команде».
-async function screenJoin(org) {
-  const code = await V.teamCode(org);
-  authCard('Вступить в «' + org.name + '»', 'Сначала убедитесь, что это настоящая команда. Попросите владельца открыть раздел «Команда» и назвать код команды.',
-    h('div', { class: 'codes' }, h('div', null, h('span', { class: 'muted' }, 'Код команды'), h('strong', { class: 'code' }, code))),
-    h('button', { class: 'btn primary wide', onclick: () => screenJoinForm(org, code) }, 'Код совпадает'),
-    h('p', { class: 'muted small center' }, 'Не совпадает? Ничего не вводите и сообщите владельцу: файлы команды в Dropbox могли подменить.'),
-    h('button', { class: 'btn link', onclick: () => screenWho(org) }, 'Назад'));
-}
-
-function screenJoinForm(org, teamCode) {
+function screenJoinForm(org) {
   const name = h('input', { required: true, maxlength: 60, autocomplete: 'name' });
   const mp = masterPasswordFields();
-  authCard('Ваш аккаунт', 'Владелец или админ команды подтвердит его. Пока ждёте, можно пользоваться личным сейфом.',
+  authCard('Вступить в «' + org.name + '»', 'Придумайте мастер-пароль. Владелец или админ подтвердит заявку, а пока можно пользоваться личным сейфом.',
     h('form', {
       onsubmit: e => {
         e.preventDefault();
         const btn = e.currentTarget.querySelector('button[type=submit]');
         run(async () => {
           const password = mp.value();
-          const s = await V.joinTeam(state.storage, { userName: name.value.trim(), password, seen: V.localSeen, expectedTeamCode: teamCode });
+          const s = await V.joinTeam(state.storage, { userName: name.value.trim(), password, seen: V.localSeen, expectedTeamCode: await V.teamCode(org) });
+          state.storage.invite = null;
+          sessionSet('invite', null);
           LS.set('uid.' + s.orgId, s.me.uid);
           await screenJoined(s);
         }, btn);
@@ -292,7 +301,7 @@ function screenJoinForm(org, teamCode) {
     field('Ваше имя', name),
     ...mp.els,
     h('button', { class: 'btn primary wide', type: 'submit' }, 'Отправить заявку')),
-    h('button', { class: 'btn link', onclick: () => screenWho(org) }, 'Назад'));
+    h('button', { class: 'btn link', onclick: () => { state.storage.invite = null; sessionSet('invite', null); screenWho(org); } }, 'У меня уже есть аккаунт'));
 }
 
 async function screenJoined(s) {
@@ -369,6 +378,15 @@ async function sync(manual = false) {
     if (s.isAdmin) refreshPendingCount();
     if (manual) toast(state.storage.offline ? 'Нет сети, показаны сохранённые данные' : 'Обновлено');
   } catch (e) {
+    if (e instanceof V.RemovedError || (e instanceof ApiError && e.status === 401 && /удал/i.test(e.message))) {
+      // Нас удалили: стираем сохранённые на устройстве данные команды и выходим
+      state.storage.clear?.();
+      LS.del('uid.' + s.orgId);
+      state.syncing = false;
+      lock();
+      toast(e instanceof V.RemovedError ? e.message : 'Вас удалили из команды. Данные команды больше недоступны.', 'error');
+      return;
+    }
     if (manual) toast(e.message, 'error');
     else console.warn(e);
   } finally {
@@ -597,7 +615,7 @@ function renderItem($d) {
     // Показываем нормализованный адрес: похожие буквы из других алфавитов видны как xn--…
     card.append(row('Сайт', h('span', { class: 'ellipsis', title: href || uri }, href || uri), [
       href ? h('a', { class: 'icon-btn', href, target: '_blank', rel: 'noopener noreferrer', title: 'Открыть сайт', 'aria-label': 'Открыть сайт' }, icon('external')) : null,
-      iconBtn('copy', 'Копировать адрес', () => copy(uri, 'Адрес скопирован')),
+      iconBtn('copy', 'Копировать адрес', () => copy(uri, 'Адрес скопирован', false)),
     ]));
   }
   if (it.notes) card.append(row('Заметки', h('div', { class: 'notes' }, it.notes), [], 'block'));
@@ -703,7 +721,11 @@ async function renderTeam() {
   const teamCode = await V.teamCode(s.org);
   body.append(h('div', { class: 'card pad' },
     h('p', null, 'Код команды: ', h('strong', { class: 'code' }, teamCode)),
-    h('p', { class: 'muted small' }, 'Новые участники сверяют этот код с владельцем. Чтобы позвать человека: поделитесь папкой Dropbox ', h('code', null, LS.get('folder')), ', пусть он откроет Ключницу, выберет эту папку и нажмёт «Я новый участник».')));
+    s.isAdmin
+      ? h('div', null,
+        h('p', { class: 'muted small' }, 'Чтобы позвать человека, отправьте ему ссылку-приглашение. Он откроет её, придумает мастер-пароль, а вы примете заявку здесь.'),
+        h('button', { class: 'btn primary', onclick: e => run(() => inviteDialog(), e.currentTarget) }, icon('plus'), 'Пригласить'))
+      : h('p', { class: 'muted small' }, 'Приглашать новых участников могут владелец и админы.')));
 
   if (s.pending) {
     body.append(h('div', { class: 'banner' }, icon('clock'), h('span', null, 'Ваша заявка ждёт одобрения. Ваш код: ', h('strong', { class: 'code' }, await s.myCode()))));
@@ -743,11 +765,11 @@ async function renderTeam() {
           }, h('option', { value: 'member', selected: m.role === 'member' }, 'Участник'), h('option', { value: 'admin', selected: m.role === 'admin' }, 'Админ'))
           : h('span', { class: 'tag' }, ROLE[m.role]),
         canEdit ? iconBtn('trash', 'Удалить из команды', e => run(async () => {
-          if (!await confirmDialog('Удалить ' + m.name + '?', 'Человек потеряет доступ, а ключи всех его коллекций сменятся. Не забудьте ещё закрыть ему доступ к папке в самом Dropbox.', 'Удалить', true)) return;
+          if (!await confirmDialog('Удалить ' + m.name + '?', 'Доступ пропадёт сразу на всех его устройствах, а ключи его коллекций сменятся.', 'Удалить', true)) return;
           await s.removeMember(uid);
           await modal(m.name + ' удалён из команды', h('div', null,
-            h('p', null, 'Ключи его коллекций сменены, новые записи он не прочитает.'),
-            h('p', { class: 'warn' }, icon('shield'), 'Но пароли, которые он уже видел, он мог запомнить или скопировать. Смените важные пароли на самих сайтах. И закройте ему доступ к папке в Dropbox: «Поделиться» → убрать человека.')),
+            h('p', null, 'Сервер больше не пускает его, ключи его коллекций сменены.'),
+            h('p', { class: 'warn' }, icon('shield'), 'Но пароли, которые он уже видел, он мог запомнить или скопировать. Смените важные пароли на самих сайтах.')),
           [{ label: 'Понятно', kind: 'primary', value: true }]);
           await s.loadAll(); renderNav(); renderContent();
         }, e.currentTarget)) : null));
@@ -766,6 +788,17 @@ async function renderTeam() {
       s.isAdmin ? h('div', { class: 'member-actions' }, iconBtn('edit', 'Настроить доступ', () => collectionDialog(cid))) : null);
   })));
   if (!s.isAdmin) body.append(h('p', { class: 'muted small' }, 'Менять состав команды и доступы могут владелец и админы.'));
+}
+
+async function inviteDialog() {
+  if (state.demo) return toast('В демо-режиме приглашения не нужны: нажмите «Я новый участник» на экране входа');
+  const { token, expires } = await state.storage.createInvite();
+  const link = teamLink(token);
+  await modal('Приглашение', h('div', null,
+    h('p', null, 'Отправьте эту ссылку коллеге (лично, в мессенджере):'),
+    h('div', { class: 'code-row' }, h('code', null, link), iconBtn('copy', 'Скопировать', () => copy(link, 'Ссылка скопирована', false))),
+    h('p', { class: 'muted small' }, `Действует до ${formatDate(expires)}, по ней можно вступить до 25 человек. Каждую заявку вы всё равно принимаете вручную.`)),
+  [{ label: 'Скопировать и закрыть', kind: 'primary', onClick: () => copy(link, 'Ссылка скопирована', false).then(() => true) }]);
 }
 
 async function approveDialog(p) {
@@ -911,16 +944,17 @@ async function renderSettings() {
         h('button', { class: 'btn', onclick: () => exportDialog() }, icon('download'), 'Экспорт')),
       importFile),
 
-    h('h3', null, 'Dropbox'),
+    h('h3', null, 'Это устройство'),
     h('div', { class: 'card pad' },
-      h('p', null, 'Папка: ', h('code', null, LS.get('folder'))),
-      h('div', { class: 'gen-actions' },
-        h('button', { class: 'btn', onclick: () => { lock(); LS.del('folder'); start(); } }, 'Другая папка'),
-        h('button', { class: 'btn danger ghost', onclick: e => run(async () => {
-          if (!await confirmDialog('Отключить Dropbox?', 'На этом устройстве придётся заново войти в Dropbox. Данные в Dropbox останутся.', 'Отключить', true)) return;
-          await state.auth.disconnect();
-          lock();
-        }, e.currentTarget) }, 'Отключить Dropbox'))),
+      state.demo ? h('p', { class: 'muted small' }, 'Демо-режим: данные живут только в этой вкладке.') : h('div', null,
+        h('p', { class: 'muted small' }, 'Вход с другого устройства: откройте там эту ссылку и войдите своим мастер-паролем. Ссылка не даёт доступа к паролям без мастер-пароля, но не публикуйте её.'),
+        h('div', { class: 'gen-actions' },
+          h('button', { class: 'btn', onclick: () => copy(teamLink(), 'Ссылка скопирована', false) }, icon('copy'), 'Ссылка для входа'),
+          h('button', { class: 'btn danger ghost', onclick: e => run(async () => {
+            if (!await confirmDialog('Забыть команду на этом устройстве?', 'Сохранённые на устройстве зашифрованные данные удалятся. Чтобы войти снова, понадобится ссылка команды. Данные на сервере останутся.', 'Забыть', true)) return;
+            forgetDevice();
+            lock();
+          }, e.currentTarget) }, 'Забыть на этом устройстве')))),
 
     h('p', { class: 'muted small center' }, 'Ключница ' + APP_VERSION + ' · шифрование AES-256-GCM, Argon2id, X25519, Ed25519'))));
 }
@@ -980,6 +1014,11 @@ setInterval(() => {
   if (Date.now() - lastActive > lockMinutes() * 60000) return lock();
   if (document.visibilityState === 'visible' && !state.editing && Date.now() - state.syncedAt > 60000) sync();
 }, 10000);
+
+// Ссылку команды вставили в уже открытую вкладку - страница не перезагружается, разбираем сами
+addEventListener('hashchange', () => {
+  if (/(^#|&)(t|setup)=/.test(location.hash)) lock();
+});
 
 document.addEventListener('visibilitychange', () => {
   if (!state.session || document.visibilityState !== 'visible') return;

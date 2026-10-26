@@ -73,6 +73,15 @@ export async function deriveMasterKey(password, kdf) {
   });
 }
 
+// Из мастер-ключа - два независимых подключа:
+// enc шифрует ключи участника, auth уходит на сервер для проверки пароля (по нему нельзя получить enc)
+export async function masterSubkeys(master) {
+  return {
+    enc: await hkdf(master, new Uint8Array(0), te.encode('keybox/master/enc')),
+    auth: b64e(await hkdf(master, new Uint8Array(0), te.encode('keybox/master/auth'))),
+  };
+}
+
 export function newKdf() {
   return { ...KDF_DEFAULT, salt: b64e(randomBytes(16)) };
 }
@@ -174,6 +183,11 @@ export async function verifyObj(signPkB64, sig, obj) {
   } catch {
     return false;
   }
+}
+
+// Что подписывается в каждом запросе к серверу: метод, путь, время и хэш тела
+export function requestPayload(method, path, ts, bodyHash) {
+  return `keybox-req/v1\n${method}\n${path}\n${ts}\n${bodyHash}`;
 }
 
 // ---------- проверочный код (сверяется голосом или в мессенджере) ----------

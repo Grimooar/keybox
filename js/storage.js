@@ -5,9 +5,15 @@
 //   remove(path)
 // Если файл изменили одновременно с другого устройства, write бросает ConflictError,
 // и вызывающий код перечитывает файл и повторяет операцию.
+// ApiStorage дополнительно умеет вход по паролю (prelogin/login) и подписывает запросы.
+
+import { requestPayload, sha256b64, signObj } from './crypto.js';
 
 export class ConflictError extends Error {}
 export class NetworkError extends Error {}
+export class ApiError extends Error {
+  constructor(status, message) { super(message); this.status = status; }
+}
 
 export class MemoryStorage {
   constructor() { this.files = new Map(); this.n = 0; }
@@ -36,103 +42,107 @@ export class MemoryStorage {
   async remove(path) { this.files.delete(path.toLowerCase()); }
 }
 
-// Заголовок Dropbox-API-Arg - только ASCII
-function apiArg(obj) {
-  return JSON.stringify(obj).replace(/[\u007f-￿]/g, c => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
-}
-
-async function dbxFail(r) {
-  let summary = '';
-  try { summary = (await r.json()).error_summary || ''; } catch { /* тело не JSON */ }
-  const e = new Error(`Dropbox: ${r.status} ${summary}`.trim());
-  e.status = r.status;
-  e.summary = summary;
-  return e;
-}
-
-export class DropboxStorage {
-  constructor(auth, root) {
-    this.auth = auth;
-    this.root = '/' + root.replace(/^\/+|\/+$/g, '');
+// Клиент сервера Ключницы (server/). team - секрет команды из ссылки.
+export class ApiStorage {
+  constructor(base, team, fetchFn = (...a) => globalThis.fetch(...a)) {
+    this.base = base.replace(/\/+$/, '');
+    this.team = team;
+    this.fetch = fetchFn;
+    this.id = null;     // { uid, signSk } после входа
+    this.invite = null; // токен приглашения для заявки
   }
 
-  p(path) { return this.root + '/' + path; }
+  authenticate(uid, signSk) { this.id = { uid, signSk }; }
 
-  async rpc(endpoint, body) {
-    return this.auth.fetch('https://api.dropboxapi.com/2/' + endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
+  async req(method, path, body = null, { sign = true, headers = {} } = {}) {
+    const h = { ...headers };
+    if (this.team) h['X-KB-Team'] = this.team;
+    if (body != null) h['Content-Type'] = 'text/plain;charset=utf-8';
+    if (sign && this.id) {
+      const ts = Date.now();
+      const sig = await signObj(this.id.signSk, requestPayload(method, '/' + path, ts, await sha256b64(body ?? '')));
+      h['X-KB-Auth'] = `${this.id.uid}:${ts}:${sig}`;
+    }
+    let r;
+    try {
+      r = await this.fetch(this.base + '/' + path, { method, headers: h, body: body ?? undefined });
+    } catch (e) {
+      throw new NetworkError('Нет связи с сервером');
+    }
+    const data = await r.json().catch(() => ({}));
+    return { r, data };
+  }
+
+  static fail(r, data) {
+    return new ApiError(r.status, data.error || 'Сервер ответил ' + r.status);
+  }
+
+  async status() {
+    const { r, data } = await this.req('GET', 'api/status', null, { sign: false });
+    if (!r.ok) throw ApiStorage.fail(r, data);
+    return data;
   }
 
   async read(path) {
-    const r = await this.auth.fetch('https://content.dropboxapi.com/2/files/download', {
-      method: 'POST',
-      headers: { 'Dropbox-API-Arg': apiArg({ path: this.p(path) }) },
-    });
-    if (r.status === 409) {
-      const e = await dbxFail(r);
-      if (e.summary.includes('not_found')) return null;
-      throw e;
-    }
-    if (!r.ok) throw await dbxFail(r);
-    const meta = JSON.parse(r.headers.get('Dropbox-API-Result'));
-    return { text: await r.text(), rev: meta.rev };
+    const { r, data } = await this.req('GET', 'api/f/' + path);
+    if (r.status === 404) return null;
+    if (!r.ok) throw ApiStorage.fail(r, data);
+    return { text: data.text, rev: Number(r.headers.get('X-KB-Rev')) };
   }
 
   async write(path, text, rev) {
-    const arg = {
-      path: this.p(path),
-      mode: rev ? { '.tag': 'update', update: rev } : 'add',
-      autorename: false,
-      mute: true,
-      strict_conflict: true,
-    };
-    const r = await this.auth.fetch('https://content.dropboxapi.com/2/files/upload', {
-      method: 'POST',
-      headers: { 'Dropbox-API-Arg': apiArg(arg), 'Content-Type': 'application/octet-stream' },
-      body: new Blob([text]),
-    });
-    if (r.status === 409) {
-      const e = await dbxFail(r);
-      if (e.summary.includes('conflict')) throw new ConflictError(path);
-      throw e;
-    }
-    if (!r.ok) throw await dbxFail(r);
-    return (await r.json()).rev;
+    // Новый участник ещё без ключей на сервере: заявку пропускает токен приглашения
+    const join = rev == null && path.startsWith('users/') && this.invite && !this.id;
+    const { r, data } = await this.req('PUT', `api/f/${path}?rev=${rev == null ? 'new' : rev}`, text,
+      join ? { sign: false, headers: { 'X-KB-Invite': this.invite } } : {});
+    if (r.status === 409) throw new ConflictError(data.error || path);
+    if (!r.ok) throw ApiStorage.fail(r, data);
+    return Number(r.headers.get('X-KB-Rev'));
   }
 
   async list(dir) {
-    let r = await this.rpc('files/list_folder', { path: this.p(dir) });
-    const names = [];
-    for (;;) {
-      if (r.status === 409) {
-        const e = await dbxFail(r);
-        if (e.summary.includes('not_found')) return names;
-        throw e;
-      }
-      if (!r.ok) throw await dbxFail(r);
-      const page = await r.json();
-      for (const e of page.entries) if (e['.tag'] === 'file') names.push(e.name);
-      if (!page.has_more) return names;
-      r = await this.rpc('files/list_folder/continue', { cursor: page.cursor });
-    }
+    const { r, data } = await this.req('GET', 'api/list/' + dir.replace(/\/+$/, ''));
+    if (!r.ok) throw ApiStorage.fail(r, data);
+    return data.names;
   }
 
   async remove(path) {
-    const r = await this.rpc('files/delete_v2', { path: this.p(path) });
-    if (r.status === 409) {
-      const e = await dbxFail(r);
-      if (e.summary.includes('not_found')) return;
-      throw e;
-    }
-    if (!r.ok) throw await dbxFail(r);
+    const { r, data } = await this.req('DELETE', 'api/f/' + path);
+    if (!r.ok && r.status !== 404) throw ApiStorage.fail(r, data);
+  }
+
+  async people() {
+    const { r, data } = await this.req('GET', 'api/people', null, { sign: false });
+    if (!r.ok) throw ApiStorage.fail(r, data);
+    return data.people;
+  }
+
+  async prelogin(uid) {
+    const { r, data } = await this.req('GET', 'api/prelogin/' + uid, null, { sign: false });
+    if (!r.ok) throw ApiStorage.fail(r, data);
+    return data;
+  }
+
+  async login(uid, authKey) {
+    const { r, data } = await this.req('POST', 'api/login', JSON.stringify({ uid, authKey }), { sign: false });
+    if (!r.ok) throw ApiStorage.fail(r, data);
+    return { text: data.text, rev: Number(r.headers.get('X-KB-Rev')) };
+  }
+
+  async setup(payload) {
+    const { r, data } = await this.req('POST', 'api/setup', JSON.stringify(payload), { sign: false });
+    if (!r.ok) throw ApiStorage.fail(r, data);
+  }
+
+  async createInvite() {
+    const { r, data } = await this.req('POST', 'api/invites', '');
+    if (!r.ok) throw ApiStorage.fail(r, data);
+    return data;
   }
 }
 
-// Обёртка: запоминает последние прочитанные (зашифрованные) файлы,
-// чтобы без интернета можно было хотя бы смотреть пароли.
+// Обёртка: запоминает последние прочитанные (зашифрованные) ответы,
+// чтобы без интернета можно было открыть сейф и смотреть пароли.
 export class CachedStorage {
   constructor(inner, ns, store = globalThis.localStorage) {
     this.inner = inner;
@@ -164,8 +174,28 @@ export class CachedStorage {
     }
   }
 
+  clear() {
+    try {
+      for (let i = this.store.length - 1; i >= 0; i--) {
+        const k = this.store.key(i);
+        if (k?.startsWith(this.ns)) this.store.removeItem(k);
+      }
+    } catch { /* нет доступа */ }
+  }
+
+  get invite() { return this.inner.invite; }
+  set invite(v) { this.inner.invite = v; }
+  authenticate(uid, signSk) { this.inner.authenticate?.(uid, signSk); }
+
   read(path) { return this.cached('f:' + path, () => this.inner.read(path)); }
   list(dir) { return this.cached('d:' + dir, () => this.inner.list(dir)); }
+  people() { return this.cached('people', () => this.inner.people()); }
+  prelogin(uid) { return this.cached('pre:' + uid, () => this.inner.prelogin(uid)); }
+  // Ответ входа - это зашифрованный файл участника; без сети пароль проверит расшифровка
+  login(uid, authKey) { return this.cached('login:' + uid, () => this.inner.login(uid, authKey)); }
+  status() { return this.inner.status(); }
+  setup(p) { return this.inner.setup(p); }
+  createInvite() { return this.inner.createInvite(); }
 
   async write(path, text, rev) {
     const newRev = await this.inner.write(path, text, rev);

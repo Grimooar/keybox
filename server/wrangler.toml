@@ -1,0 +1,12 @@
+name = "keybox-api"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+workers_dev = true
+
+[vars]
+ALLOWED_ORIGINS = "https://grimooar.github.io,http://localhost:8765"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "keybox"
+database_id = "720a66c0-fb8f-423c-b91e-1a976aa2cc7c"
