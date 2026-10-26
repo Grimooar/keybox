@@ -1,7 +1,7 @@
 // Офлайн-оболочка: файлы приложения берём из сети, а без сети - из кэша.
 // Запросы к серверу здесь не кэшируются (их зашифрованный кэш ведёт само приложение).
 
-const CACHE = 'keybox-v6';
+const CACHE = 'keybox-v7';
 const FILES = [
   './', 'index.html', 'manifest.webmanifest', 'css/app.css',
   'js/app.js', 'js/config.js', 'js/crypto.js', 'js/storage.js', 'js/tools.js', 'js/ui.js', 'js/vault.js',

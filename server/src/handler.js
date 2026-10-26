@@ -53,12 +53,12 @@ export async function handle(request, db, env) {
     'Access-Control-Allow-Origin': allowed.includes(origin) ? origin : allowed[0] || 'null',
     'Access-Control-Allow-Methods': 'GET, PUT, POST, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, X-KB-Team, X-KB-Auth, X-KB-Invite',
-    'Access-Control-Expose-Headers': 'X-KB-Rev',
+    'Access-Control-Expose-Headers': 'X-KB-Rev, X-KB-Time',
     'Access-Control-Max-Age': '86400',
     Vary: 'Origin',
   };
   const json = (status, obj, extra = {}) => new Response(JSON.stringify(obj), {
-    status, headers: { ...cors, 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...extra },
+    status, headers: { ...cors, 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'X-KB-Time': String(Date.now()), ...extra },
   });
 
   if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });

@@ -50,16 +50,25 @@ export class ApiStorage {
     this.fetch = fetchFn;
     this.id = null;     // { uid, signSk } после входа
     this.invite = null; // токен приглашения для заявки
+    this.skew = 0;      // насколько часы сервера впереди часов устройства, мс
   }
 
   authenticate(uid, signSk) { this.id = { uid, signSk }; }
 
-  async req(method, path, body = null, { sign = true, headers = {} } = {}) {
+  async req(method, path, body = null, opts = {}) {
+    const res = await this.send(method, path, body, opts);
+    // Часы устройства сильно врут - повторяем один раз со временем сервера (оно уже учтено в skew)
+    if (res.r.status === 401 && /время/.test(res.data.error || '')) return this.send(method, path, body, opts);
+    return res;
+  }
+
+  async send(method, path, body, { sign = true, headers = {} } = {}) {
     const h = { ...headers };
     if (this.team) h['X-KB-Team'] = this.team;
     if (body != null) h['Content-Type'] = 'text/plain;charset=utf-8';
     if (sign && this.id) {
-      const ts = Date.now();
+      // Подпись со временем сервера, а не устройства: у многих часы спешат или отстают
+      const ts = Date.now() + this.skew;
       const sig = await signObj(this.id.signSk, requestPayload(method, '/' + path, ts, await sha256b64(body ?? '')));
       h['X-KB-Auth'] = `${this.id.uid}:${ts}:${sig}`;
     }
@@ -69,6 +78,8 @@ export class ApiStorage {
     } catch (e) {
       throw new NetworkError('Нет связи с сервером. Проверьте интернет. Если не помогает: обновите страницу (Ctrl+Shift+R), а при VPN попробуйте включить или выключить его.');
     }
+    const serverTime = Number(r.headers.get('X-KB-Time'));
+    if (serverTime) this.skew = serverTime - Date.now();
     const data = await r.json().catch(() => ({}));
     return { r, data };
   }
