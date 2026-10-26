@@ -67,7 +67,7 @@ export class ApiStorage {
     try {
       r = await this.fetch(this.base + '/' + path, { method, headers: h, body: body ?? undefined });
     } catch (e) {
-      throw new NetworkError('Нет связи с сервером');
+      throw new NetworkError('Нет связи с сервером. Проверьте интернет. Если не помогает: обновите страницу (Ctrl+Shift+R), а при VPN попробуйте включить или выключить его.');
     }
     const data = await r.json().catch(() => ({}));
     return { r, data };
