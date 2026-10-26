@@ -1,0 +1,614 @@
+// Модель хранилища команды.
+//
+// Файлы в папке Dropbox (всё, кроме публичных ключей и имён, зашифровано):
+//   org.json            - состав команды, коллекции и ключи коллекций, запечатанные
+//                         для каждого участника. Подписан владельцем или админом.
+//   users/<uid>.json    - участник: публичные ключи + секретные ключи под мастер-паролем.
+//   vault/<cid>.json    - записи коллекции, зашифрованы ключом коллекции.
+//   vault/p-<uid>.json  - личный сейф участника.
+//
+// Кому доверять, устройство узнаёт из «закрепа» (pin) - id команды и ключа владельца,
+// который хранится внутри зашифрованных данных участника. Подменить org.json
+// (добавить себя, выдать себе ключ) без ключа владельца или админа нельзя.
+
+import * as C from './crypto.js';
+import { ConflictError } from './storage.js';
+
+export const ORG = 'org.json';
+const userPath = uid => `users/${uid}.json`;
+const vaultPath = cid => `vault/${cid}.json`;
+export const personalCid = uid => 'p-' + uid;
+
+const adWrap = (orgId, cid, ver, uid) => `wrap:${orgId}:${cid}:${ver}:${uid}`;
+const adHist = (orgId, cid, ver) => `hist:${orgId}:${cid}:${ver}`;
+const adVault = (orgId, cid, ver) => `vault:${orgId}:${cid}:${ver}`;
+const adUser = uid => `user:${uid}`;
+const selfPayload = (f, orgId) => ({ t: 'user', orgId, uid: f.uid, name: f.name, boxPk: f.boxPk, signPk: f.signPk });
+const vaultPayload = (orgId, f) => ({ t: 'vault', orgId, cid: f.cid, keyVersion: f.keyVersion, seq: f.seq, data: f.data, signer: f.signer });
+
+// id участников берутся в том числе из имён файлов - пропускаем только наш формат
+export const isUid = uid => typeof uid === 'string' && /^[0-9a-f]{32}$/.test(uid);
+function checkUid(uid) {
+  if (!isUid(uid)) throw new VaultError('Неверный идентификатор участника');
+  return uid;
+}
+
+const RETRIES = 6;
+
+export class VaultError extends Error {}
+
+// Последние виденные версии org.json - защита от отката к старому файлу
+export const localSeen = {
+  get(orgId) { try { return JSON.parse(localStorage.getItem('kb.seen.' + orgId) || 'null'); } catch { return null; } },
+  set(orgId, v) { try { localStorage.setItem('kb.seen.' + orgId, JSON.stringify(v)); } catch { /* приватный режим */ } },
+};
+
+export function memorySeen() {
+  const m = new Map();
+  return { get: k => m.get(k) || null, set: (k, v) => m.set(k, v) };
+}
+
+export async function readOrg(storage) {
+  const r = await storage.read(ORG);
+  return r ? { org: JSON.parse(r.text), rev: r.rev } : null;
+}
+
+export function memberCode(uid, m) {
+  return C.fingerprint(uid, m.boxPk, m.signPk);
+}
+
+// Код команды = код владельца. Новый участник сверяет его с владельцем.
+export function teamCode(org) {
+  return memberCode(org.owner.uid, org.members[org.owner.uid]);
+}
+
+function adminsOf(org) {
+  const out = {};
+  for (const [uid, m] of Object.entries(org.members)) if (m.role === 'admin') out[uid] = m.signPk;
+  return out;
+}
+
+// Кто получает ключ коллекции: «для всех» - вся команда, иначе выбранные + владелец и админы
+export function accessOf(org, col) {
+  const uids = Object.keys(org.members);
+  if (col.all) return uids;
+  return uids.filter(uid => col.members.includes(uid) || org.members[uid].role !== 'member');
+}
+
+const fake = () => new VaultError('Файл команды повреждён или подделан. Восстановите прошлую версию org.json в Dropbox.');
+
+export async function verifyOrg(org, pin, seen) {
+  if (!org || org.v !== 1 || org.orgId !== pin.orgId) throw fake();
+  const owner = org.members?.[org.owner?.uid];
+  if (org.owner.signPk !== pin.ownerSignPk || !owner || owner.role !== 'owner' || owner.signPk !== pin.ownerSignPk) throw fake();
+
+  const c = org.adminCert;
+  const cert = { orgId: c?.orgId, certVersion: c?.certVersion, admins: c?.admins };
+  if (c?.orgId !== org.orgId || !await C.verifyObj(pin.ownerSignPk, c.sig, cert)) throw fake();
+
+  const signers = { ...c.admins, [org.owner.uid]: pin.ownerSignPk };
+  const signerPk = signers[org.signer];
+  const { sig, ...body } = org;
+  if (!signerPk || !await C.verifyObj(signerPk, sig, body)) throw fake();
+
+  // Роли в файле должны совпадать с сертификатом админов от владельца
+  for (const [uid, m] of Object.entries(org.members)) {
+    if (!isUid(uid)) throw fake();
+    const certified = c.admins[uid];
+    if (m.role === 'admin' ? certified !== m.signPk : certified !== undefined) throw fake();
+    if (m.role === 'owner' && uid !== org.owner.uid) throw fake();
+  }
+  for (const uid of Object.keys(c.admins)) if (!org.members[uid]) throw fake();
+
+  const last = seen?.get(org.orgId);
+  if (last && (org.version < last.version || c.certVersion < last.certVersion)) {
+    throw new VaultError('В Dropbox лежит более старая версия файла команды, чем это устройство уже видело. Похоже на откат или подмену.');
+  }
+}
+
+async function makeUser({ uid, name, password, pin, keys }) {
+  keys = keys || await C.generateUserKeys();
+  const kdf = C.newKdf();
+  const master = await C.deriveMasterKey(password, kdf);
+  const secret = {
+    boxPk: keys.boxPk, signPk: keys.signPk,
+    boxSk: keys.boxSk, signSk: keys.signSk,
+    personalKey: C.b64e(C.randomBytes(32)),
+    pin,
+  };
+  const file = { v: 1, uid, name, boxPk: keys.boxPk, signPk: keys.signPk, kdf, createdAt: Date.now() };
+  const me = await meFromSecret(uid, name, secret);
+  file.selfSig = await C.signObj(me.signSk, selfPayload(file, pin.orgId));
+  file.secret = await C.encryptJSON(master, secret, adUser(uid));
+  return { file, me };
+}
+
+async function meFromSecret(uid, name, secret) {
+  return {
+    uid, name,
+    boxPk: secret.boxPk, signPk: secret.signPk,
+    boxSk: await C.importBoxSk(secret.boxSk),
+    signSk: await C.importSignSk(secret.signSk),
+    personalKey: C.b64d(secret.personalKey),
+    pin: secret.pin,
+    secret,
+  };
+}
+
+async function openUser(file, password) {
+  const master = await C.deriveMasterKey(password, file.kdf);
+  let secret;
+  try {
+    secret = await C.decryptJSON(master, file.secret, adUser(file.uid));
+  } catch {
+    throw new VaultError('Неверный мастер-пароль');
+  }
+  return meFromSecret(file.uid, file.name, secret);
+}
+
+// ---------- вход ----------
+
+export async function createTeam(storage, { teamName, userName, password, seen }) {
+  if (await storage.read(ORG)) throw new VaultError('В этой папке уже есть команда');
+  const orgId = C.randomHex(16);
+  const uid = C.randomHex(16);
+  const keys = await C.generateUserKeys();
+  const { file, me } = await makeUser({ uid, name: userName, password, keys, pin: { orgId, ownerSignPk: keys.signPk } });
+
+  const cert = { orgId, certVersion: 1, admins: {} };
+  const cid = C.randomHex(12);
+  const org = {
+    v: 1, orgId, name: teamName, version: 1,
+    owner: { uid, signPk: keys.signPk },
+    adminCert: { ...cert, sig: await C.signObj(me.signSk, cert) },
+    members: { [uid]: { name: userName, role: 'owner', boxPk: keys.boxPk, signPk: keys.signPk, addedAt: Date.now() } },
+    collections: { [cid]: { name: 'Общее', all: true, members: [], keyVersion: 1, wraps: {}, history: null } },
+  };
+  org.collections[cid].wraps[uid] = await C.sealTo(keys.boxPk, C.randomBytes(32), adWrap(orgId, cid, 1, uid));
+  org.signer = uid;
+  org.sig = await C.signObj(me.signSk, org);
+
+  await storage.write(userPath(uid), JSON.stringify(file, null, 1), null);
+  try {
+    await storage.write(ORG, JSON.stringify(org, null, 1), null);
+  } catch (e) {
+    await storage.remove(userPath(uid)).catch(() => {});
+    if (e instanceof ConflictError) throw new VaultError('В этой папке уже есть команда');
+    throw e;
+  }
+  const s = new Session(storage, me, seen);
+  await s.refresh();
+  return s;
+}
+
+// Заявка на вступление: создаём участника, админ подтверждает её у себя
+export async function joinTeam(storage, { userName, password, seen }) {
+  const r = await readOrg(storage);
+  if (!r) throw new VaultError('В этой папке нет команды');
+  const pin = { orgId: r.org.orgId, ownerSignPk: r.org.owner?.signPk };
+  await verifyOrg(r.org, pin, seen);
+  const uid = C.randomHex(16);
+  const { file, me } = await makeUser({ uid, name: userName, password, pin });
+  await storage.write(userPath(uid), JSON.stringify(file, null, 1), null);
+  const s = new Session(storage, me, seen);
+  await s.refresh();
+  return s;
+}
+
+export async function unlock(storage, uid, password, seen) {
+  const r = await storage.read(userPath(checkUid(uid)));
+  if (!r) throw new VaultError('Участник не найден. Возможно, его удалили из команды.');
+  const me = await openUser(JSON.parse(r.text), password);
+  const s = new Session(storage, me, seen);
+  await s.refresh();
+  return s;
+}
+
+// Список людей для экрана входа (без расшифровки)
+export async function listPeople(storage) {
+  const r = await readOrg(storage);
+  const people = [];
+  const seenUids = new Set();
+  if (r) {
+    for (const [uid, m] of Object.entries(r.org.members || {})) {
+      people.push({ uid, name: m.name, role: m.role });
+      seenUids.add(uid);
+    }
+  }
+  for (const n of await storage.list('users')) {
+    const uid = n.replace(/\.json$/i, '').toLowerCase();
+    if (!isUid(uid) || seenUids.has(uid)) continue;
+    const f = await storage.read(userPath(uid));
+    if (f) people.push({ uid, name: JSON.parse(f.text).name, role: 'pending' });
+  }
+  return people;
+}
+
+// ---------- сессия ----------
+
+export class Session {
+  constructor(storage, me, seen) {
+    this.s = storage;
+    this.me = me;
+    this.seen = seen;
+    this.org = null;
+    this.orgRev = null;
+    this.keys = new Map();   // cid -> { ver, key, old: { ver: key } }
+    this.vaults = new Map(); // cid -> { items, rev, error? }
+  }
+
+  get orgId() { return this.me.pin.orgId; }
+  get member() { return this.org?.members[this.me.uid] || null; }
+  get role() { return this.member?.role || 'pending'; }
+  get isOwner() { return this.role === 'owner'; }
+  get isAdmin() { return this.role === 'owner' || this.role === 'admin'; }
+  get pending() { return !this.member; }
+  get personalCid() { return personalCid(this.me.uid); }
+
+  async refresh() {
+    const r = await readOrg(this.s);
+    if (!r) throw new VaultError('Файл команды не найден в папке Dropbox');
+    await verifyOrg(r.org, this.me.pin, this.seen);
+    const m = r.org.members[this.me.uid];
+    if (m && (m.boxPk !== this.me.boxPk || m.signPk !== this.me.signPk)) {
+      throw new VaultError('Ваши ключи в файле команды не совпадают с вашими. Попросите админа заново добавить вас.');
+    }
+    this.org = r.org;
+    this.orgRev = r.rev;
+    this.bumpSeen();
+    await this.unwrapKeys();
+  }
+
+  bumpSeen() {
+    const last = this.seen.get(this.orgId) || { version: 0, certVersion: 0 };
+    this.seen.set(this.orgId, {
+      version: Math.max(last.version, this.org.version),
+      certVersion: Math.max(last.certVersion, this.org.adminCert.certVersion),
+    });
+  }
+
+  async unwrapKeys() {
+    const keys = new Map();
+    if (this.member) {
+      for (const [cid, col] of Object.entries(this.org.collections)) {
+        const w = col.wraps[this.me.uid];
+        if (!w) continue;
+        const key = await C.openSealed(this.me.boxSk, this.me.boxPk, w, adWrap(this.orgId, cid, col.keyVersion, this.me.uid));
+        const old = {};
+        if (col.history) {
+          const h = await C.decryptJSON(key, col.history, adHist(this.orgId, cid, col.keyVersion));
+          for (const [v, k] of Object.entries(h)) old[v] = C.b64d(k);
+        }
+        keys.set(cid, { ver: col.keyVersion, key, old });
+      }
+    }
+    this.keys = keys;
+  }
+
+  // Коллекции, к которым у меня есть доступ
+  collections() {
+    const list = [];
+    for (const [cid, col] of Object.entries(this.org?.collections || {})) {
+      if (this.keys.has(cid)) list.push({ cid, name: col.name, all: col.all });
+    }
+    list.sort((a, b) => (b.all - a.all) || a.name.localeCompare(b.name, 'ru'));
+    return [{ cid: this.personalCid, name: 'Личное', personal: true }, ...list];
+  }
+
+  collectionName(cid) {
+    return cid === this.personalCid ? 'Личное' : this.org.collections[cid]?.name || '?';
+  }
+
+  currentKey(cid) {
+    if (cid === this.personalCid) return { ver: 1, key: this.me.personalKey };
+    const k = this.keys.get(cid);
+    if (!k) throw new VaultError('Нет доступа к коллекции');
+    return k;
+  }
+
+  keyFor(cid, ver) {
+    const k = this.currentKey(cid);
+    if (ver === k.ver) return k.key;
+    if (k.old?.[ver]) return k.old[ver];
+    throw new VaultError('Ключ коллекции сменился, обновите данные');
+  }
+
+  // Кто вправе записывать коллекцию: личную - только я, общую - те, у кого есть к ней доступ
+  writerPk(cid, uid) {
+    if (cid === this.personalCid) return uid === this.me.uid ? this.me.signPk : null;
+    const col = this.org.collections[cid];
+    if (!col || !isUid(uid) || !accessOf(this.org, col).includes(uid)) return null;
+    return this.org.members[uid].signPk;
+  }
+
+  async readVault(cid) {
+    const r = await this.s.read(vaultPath(cid));
+    if (!r) return { items: {}, rev: null, seq: 0 };
+    const f = JSON.parse(r.text);
+    if (f.cid !== cid) throw new VaultError('Файл коллекции подменён');
+    // Подпись автора: без неё бывший участник, знающий старый ключ, мог бы подложить свои записи
+    const pk = this.writerPk(cid, f.signer);
+    if (!pk || !Number.isInteger(f.seq) || !await C.verifyObj(pk, f.sig, vaultPayload(this.orgId, f))) {
+      throw new VaultError('Файл коллекции «' + this.collectionName(cid) + '» подписан не участником с доступом. Восстановите прошлую версию в Dropbox.');
+    }
+    const seenKey = this.orgId + ':' + cid;
+    const last = this.seen.get(seenKey);
+    if (last && f.seq < last.seq) {
+      throw new VaultError('В Dropbox лежит более старая версия коллекции «' + this.collectionName(cid) + '», чем это устройство уже видело.');
+    }
+    const { items } = await C.decryptJSON(this.keyFor(cid, f.keyVersion), f.data, adVault(this.orgId, cid, f.keyVersion));
+    this.seen.set(seenKey, { seq: f.seq });
+    return { items, rev: r.rev, seq: f.seq };
+  }
+
+  async loadAll() {
+    const cols = this.collections();
+    await Promise.all(cols.map(async c => {
+      try {
+        this.vaults.set(c.cid, await this.readVault(c.cid));
+      } catch (e) {
+        this.vaults.set(c.cid, { items: {}, rev: null, error: e.message });
+      }
+    }));
+    for (const cid of [...this.vaults.keys()]) if (!cols.some(c => c.cid === cid)) this.vaults.delete(cid);
+  }
+
+  allItems() {
+    const out = [];
+    for (const [cid, v] of this.vaults) for (const item of Object.values(v.items)) out.push({ ...item, cid });
+    return out;
+  }
+
+  // Прочитать - изменить - записать; если кто-то успел записать раньше, повторить
+  async updateVault(cid, mutate) {
+    for (let i = 0; i < RETRIES; i++) {
+      let v;
+      try {
+        v = await this.readVault(cid);
+      } catch (e) {
+        if (i === 0 && e instanceof VaultError) { await this.refresh(); continue; }
+        throw e;
+      }
+      const res = await mutate(v.items);
+      const { ver, key } = this.currentKey(cid);
+      const file = {
+        v: 1, cid, keyVersion: ver, seq: v.seq + 1, signer: this.me.uid,
+        data: await C.encryptJSON(key, { items: v.items }, adVault(this.orgId, cid, ver)),
+      };
+      file.sig = await C.signObj(this.me.signSk, vaultPayload(this.orgId, file));
+      try {
+        const rev = await this.s.write(vaultPath(cid), JSON.stringify(file), v.rev);
+        this.seen.set(this.orgId + ':' + cid, { seq: file.seq });
+        this.vaults.set(cid, { items: v.items, rev, seq: file.seq });
+        return res;
+      } catch (e) {
+        if (!(e instanceof ConflictError)) throw e;
+        await this.refresh();
+      }
+    }
+    throw new VaultError('Не удалось сохранить: коллекцию постоянно меняют, попробуйте ещё раз');
+  }
+
+  // ---------- записи ----------
+
+  saveItem(cid, item) {
+    const now = Date.now();
+    return this.updateVault(cid, items => {
+      const prev = items[item.id];
+      const next = { ...item, cid: undefined, createdAt: prev?.createdAt || item.createdAt || now, updatedAt: now, updatedBy: this.me.uid };
+      delete next.cid;
+      next.history = prev?.history || [];
+      if (prev?.password && prev.password !== next.password) {
+        next.history = [{ password: prev.password, changedAt: now }, ...next.history].slice(0, 10);
+      }
+      items[item.id] = next;
+      return { ...next, cid };
+    });
+  }
+
+  addItems(cid, list) {
+    const now = Date.now();
+    return this.updateVault(cid, items => {
+      for (const it of list) items[it.id] = { history: [], createdAt: now, ...it, updatedAt: now, updatedBy: this.me.uid };
+      return list.length;
+    });
+  }
+
+  deleteItem(cid, id) {
+    return this.updateVault(cid, items => { delete items[id]; });
+  }
+
+  async moveItem(item, fromCid, toCid) {
+    if (fromCid === toCid) return this.saveItem(toCid, item);
+    const saved = await this.saveItem(toCid, item);
+    await this.deleteItem(fromCid, item.id);
+    return saved;
+  }
+
+  // ---------- команда (владелец и админы) ----------
+
+  async updateOrg(mutate) {
+    if (!this.isAdmin) throw new VaultError('Менять команду может только владелец или админ');
+    for (let i = 0; i < RETRIES; i++) {
+      await this.refresh();
+      const before = {};
+      for (const [cid, col] of Object.entries(this.org.collections)) before[cid] = accessOf(this.org, col);
+
+      const d = structuredClone(this.org);
+      const res = await mutate(d);
+
+      // Новые доступы - выдаём ключ; у кого забрали - меняем ключ коллекции
+      const rotated = [];
+      for (const cid of Object.keys(d.collections)) {
+        if (before[cid] && await this.applyAccess(d, cid, before[cid])) rotated.push(cid);
+      }
+
+      d.version = this.org.version + 1;
+      const admins = adminsOf(d);
+      if (C.canonical(admins) !== C.canonical(d.adminCert.admins)) {
+        if (!this.isOwner) throw new VaultError('Назначать админов может только владелец');
+        const cert = { orgId: d.orgId, certVersion: d.adminCert.certVersion + 1, admins };
+        d.adminCert = { ...cert, sig: await C.signObj(this.me.signSk, cert) };
+      }
+      d.signer = this.me.uid;
+      delete d.sig;
+      d.sig = await C.signObj(this.me.signSk, d);
+
+      try {
+        this.orgRev = await this.s.write(ORG, JSON.stringify(d, null, 1), this.orgRev);
+      } catch (e) {
+        if (e instanceof ConflictError) continue;
+        throw e;
+      }
+      this.org = d;
+      this.bumpSeen();
+      await this.unwrapKeys();
+      // Перешифровать записи новым ключом (старый ключ хранится в истории коллекции)
+      for (const cid of rotated) await this.updateVault(cid, () => {});
+      return res;
+    }
+    throw new VaultError('Не удалось сохранить: файл команды постоянно меняют, попробуйте ещё раз');
+  }
+
+  async wrapFor(d, cid, uid) {
+    const col = d.collections[cid];
+    const k = this.keys.get(cid);
+    if (!k || k.ver !== col.keyVersion) throw new VaultError('Нет актуального ключа коллекции «' + col.name + '»');
+    col.wraps[uid] = await C.sealTo(d.members[uid].boxPk, k.key, adWrap(d.orgId, cid, col.keyVersion, uid));
+  }
+
+  // Выдать ключ всем, у кого есть доступ. old - прошлые версии ключа.
+  async rekey(d, cid, key, old) {
+    const col = d.collections[cid];
+    const hist = Object.fromEntries(Object.entries(old).map(([v, k]) => [v, C.b64e(k)]));
+    col.history = Object.keys(hist).length ? await C.encryptJSON(key, hist, adHist(d.orgId, cid, col.keyVersion)) : null;
+    col.wraps = {};
+    for (const uid of accessOf(d, col)) {
+      col.wraps[uid] = await C.sealTo(d.members[uid].boxPk, key, adWrap(d.orgId, cid, col.keyVersion, uid));
+    }
+  }
+
+  async applyAccess(d, cid, before) {
+    const col = d.collections[cid];
+    const after = accessOf(d, col);
+    if (before.some(uid => !after.includes(uid))) {
+      const k = this.keys.get(cid);
+      if (!k || k.ver !== col.keyVersion) throw new VaultError('Нет актуального ключа коллекции «' + col.name + '»');
+      col.keyVersion += 1;
+      await this.rekey(d, cid, C.randomBytes(32), { ...k.old, [k.ver]: k.key });
+      return true;
+    }
+    for (const uid of after) if (!col.wraps[uid]) await this.wrapFor(d, cid, uid);
+    return false;
+  }
+
+  async pendingUsers() {
+    const out = [];
+    for (const n of await this.s.list('users')) {
+      const uid = n.replace(/\.json$/i, '').toLowerCase();
+      if (!isUid(uid) || Object.hasOwn(this.org.members, uid)) continue;
+      const r = await this.s.read(userPath(uid));
+      if (!r) continue;
+      const f = JSON.parse(r.text);
+      const valid = f.uid === uid && await C.verifyObj(f.signPk, f.selfSig, selfPayload(f, this.orgId));
+      out.push({ uid, name: f.name, createdAt: f.createdAt, valid, code: valid ? await C.fingerprint(uid, f.boxPk, f.signPk) : null });
+    }
+    return out;
+  }
+
+  // code - проверочный код, который админ сверил с новым участником
+  async approve(uid, code, cids = []) {
+    const r = await this.s.read(userPath(checkUid(uid)));
+    if (!r) throw new VaultError('Заявка не найдена');
+    const f = JSON.parse(r.text);
+    const valid = f.uid === uid && await C.verifyObj(f.signPk, f.selfSig, selfPayload(f, this.orgId));
+    if (!valid || await C.fingerprint(uid, f.boxPk, f.signPk) !== code) {
+      throw new VaultError('Заявка изменилась после проверки кода. Сверьте код заново.');
+    }
+    await this.updateOrg(d => {
+      d.members[uid] = { name: f.name, role: 'member', boxPk: f.boxPk, signPk: f.signPk, addedAt: Date.now() };
+      for (const cid of cids) {
+        const col = d.collections[cid];
+        if (col && !col.all && !col.members.includes(uid)) col.members.push(uid);
+      }
+    });
+  }
+
+  async reject(uid) {
+    checkUid(uid);
+    if (Object.hasOwn(this.org.members, uid)) throw new VaultError('Это уже участник команды');
+    if (!this.isAdmin) throw new VaultError('Отклонять заявки может только владелец или админ');
+    await this.s.remove(userPath(uid));
+  }
+
+  async removeMember(uid) {
+    checkUid(uid);
+    const m = this.org.members[uid];
+    if (!m) return;
+    if (m.role === 'owner') throw new VaultError('Владельца удалить нельзя');
+    if (uid === this.me.uid) throw new VaultError('Себя удалить нельзя');
+    if (m.role === 'admin' && !this.isOwner) throw new VaultError('Админа может удалить только владелец');
+    await this.updateOrg(d => {
+      delete d.members[uid];
+      for (const col of Object.values(d.collections)) col.members = col.members.filter(u => u !== uid);
+    });
+    await this.s.remove(userPath(uid));
+    await this.s.remove(vaultPath(personalCid(uid)));
+  }
+
+  async setRole(uid, role) {
+    if (!this.isOwner) throw new VaultError('Менять роли может только владелец');
+    if (!['admin', 'member'].includes(role)) throw new VaultError('Неизвестная роль');
+    if (this.org.members[uid]?.role === 'owner') throw new VaultError('Роль владельца не меняется');
+    await this.updateOrg(d => { d.members[uid].role = role; });
+  }
+
+  async createCollection(name, all, members = []) {
+    const cid = C.randomHex(12);
+    await this.updateOrg(async d => {
+      d.collections[cid] = { name, all: !!all, members: all ? [] : members.filter(u => d.members[u]), keyVersion: 1, wraps: {}, history: null };
+      await this.rekey(d, cid, C.randomBytes(32), {});
+    });
+    return cid;
+  }
+
+  updateCollection(cid, { name, all, members }) {
+    return this.updateOrg(d => {
+      const col = d.collections[cid];
+      if (!col) throw new VaultError('Коллекция не найдена');
+      if (name != null) col.name = name;
+      if (all != null) col.all = !!all;
+      if (members) col.members = col.all ? [] : members.filter(u => d.members[u]);
+    });
+  }
+
+  async deleteCollection(cid) {
+    await this.updateOrg(d => { delete d.collections[cid]; });
+    await this.s.remove(vaultPath(cid));
+    this.vaults.delete(cid);
+  }
+
+  // ---------- мои настройки ----------
+
+  async checkPassword(password) {
+    const r = await this.s.read(userPath(this.me.uid));
+    await openUser(JSON.parse(r.text), password);
+  }
+
+  async changePassword(newPassword) {
+    for (let i = 0; i < RETRIES; i++) {
+      const r = await this.s.read(userPath(this.me.uid));
+      const f = JSON.parse(r.text);
+      f.kdf = C.newKdf();
+      f.secret = await C.encryptJSON(await C.deriveMasterKey(newPassword, f.kdf), this.me.secret, adUser(this.me.uid));
+      try {
+        await this.s.write(userPath(this.me.uid), JSON.stringify(f, null, 1), r.rev);
+        return;
+      } catch (e) {
+        if (!(e instanceof ConflictError)) throw e;
+      }
+    }
+  }
+
+  myCode() { return C.fingerprint(this.me.uid, this.me.boxPk, this.me.signPk); }
+}
