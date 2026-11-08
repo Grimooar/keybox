@@ -168,7 +168,10 @@ async function loginFile(storage, uid, password) {
     try {
       r = await storage.login(uid, sub.auth);
     } catch (e) {
-      if (e.status === 401) throw new VaultError('Неверный мастер-пароль');
+      if (e.status === 401) {
+        const left = e.data?.left;
+        throw new VaultError('Неверный мастер-пароль' + (left >= 1 && left <= 3 ? `. Осталось попыток: ${left}, потом вход закроется на 15 минут` : ''));
+      }
       throw e;
     }
   }

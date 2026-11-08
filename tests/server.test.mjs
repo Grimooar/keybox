@@ -58,6 +58,34 @@ await test('вход по паролю: неверный пароль и бло�
   db.attempts.clear(); // снимаем блокировку для остальных тестов
 });
 
+await test('вход: сервер сообщает, сколько попыток осталось, и предупреждение появляется заранее', async () => {
+  const errs = [];
+  for (let i = 0; i < 8; i++) errs.push(await V.unlock(api(), owner.me.uid, 'guess' + i, dev()).catch(e => e.message));
+  assert.equal(errs[0], 'Неверный мастер-пароль'); // в начале без лишнего шума
+  assert.match(errs[4], /Осталось попыток: 3/);
+  assert.match(errs[6], /Осталось попыток: 1/);
+  assert.equal(errs[7], 'Неверный мастер-пароль'); // 0 - дальше уже 429 со временем ожидания
+  const r = await raw('POST', '/api/login', { body: JSON.stringify({ uid: owner.me.uid, authKey: 'x' }) });
+  assert.equal(r.status, 429);
+  assert.ok((await r.json()).wait >= 1);
+  db.attempts.clear();
+});
+
+await test('часы ПК врут на час: запросы проходят, время для 2FA берётся с сервера', async () => {
+  const realNow = Date.now;
+  const slow = () => realNow() - 3600_000;
+  // Сервер живёт по верным часам, клиент - по отстающим
+  const serverFetch = async (url, opts) => { Date.now = realNow; try { return await fetchFn(url, opts); } finally { Date.now = slow; } };
+  Date.now = slow;
+  try {
+    const st = new ApiStorage(BASE, TEAM, serverFetch);
+    const s = await V.unlock(st, owner.me.uid, 'owner-pass', dev());
+    await s.refresh();
+    assert.ok(Math.abs(st.now() - realNow()) < 5000);
+  } finally { Date.now = realNow; }
+  db.attempts.clear();
+});
+
 await test('файл участника с зашифрованными ключами не отдаётся без пароля', async () => {
   const r = await raw('GET', '/api/f/users/' + owner.me.uid + '.json');
   assert.equal(r.status, 401);

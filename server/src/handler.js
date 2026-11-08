@@ -24,9 +24,9 @@ const LIMITS = [
 ];
 
 class HttpError extends Error {
-  constructor(status, message) { super(message); this.status = status; }
+  constructor(status, message, extra) { super(message); this.status = status; this.extra = extra; }
 }
-const fail = (status, message) => { throw new HttpError(status, message); };
+const fail = (status, message, extra) => { throw new HttpError(status, message, extra); };
 
 const sha = text => C.sha256b64(text);
 
@@ -66,7 +66,7 @@ export async function handle(request, db, env) {
     const res = await route(request, url, db, env);
     return json(res.status || 200, res.body ?? {}, res.rev != null ? { 'X-KB-Rev': String(res.rev) } : {});
   } catch (e) {
-    if (e instanceof HttpError) return json(e.status, { error: e.message });
+    if (e instanceof HttpError) return json(e.status, { ...e.extra, error: e.message });
     console.error(e);
     return json(500, { error: 'Ошибка сервера' });
   }
@@ -194,13 +194,17 @@ async function login(ctx, body) {
   if (!auth || !row) fail(404, 'Участник не найден. Возможно, его удалили из команды.');
   // Попытка засчитывается ДО проверки пароля и атомарно - параллельный перебор не обходит лимит
   const now = Date.now();
+  let left = Infinity;
   for (const l of LIMITS) {
     const a = await ctx.db.attempt(l.key(uid, ctx.ip), now, l.window);
     if (a.fails > l.max) {
-      fail(429, 'Слишком много неверных попыток. Подождите ' + Math.max(1, Math.ceil((a.window_start + l.window - now) / 60000)) + ' мин.');
+      const wait = Math.max(1, Math.ceil((a.window_start + l.window - now) / 60000));
+      fail(429, 'Слишком много неверных попыток. Подождите ' + wait + ' мин.', { wait });
     }
+    left = Math.min(left, l.max - a.fails);
   }
-  if (!safeEqual(await sha(authKey), auth.hash)) fail(401, 'Неверный мастер-пароль');
+  // left - сколько ещё попыток до блокировки: приложение предупреждает заранее
+  if (!safeEqual(await sha(authKey), auth.hash)) fail(401, 'Неверный мастер-пароль', { left });
   await ctx.db.clearAttempts(LIMITS[0].key(uid, ctx.ip));
   await ctx.db.forgive(LIMITS[1].key(uid));
   return { body: { text: row.body }, rev: row.rev };

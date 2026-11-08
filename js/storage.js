@@ -12,7 +12,7 @@ import { requestPayload, sha256b64, signObj } from './crypto.js';
 export class ConflictError extends Error {}
 export class NetworkError extends Error {}
 export class ApiError extends Error {
-  constructor(status, message) { super(message); this.status = status; }
+  constructor(status, message, data = {}) { super(message); this.status = status; this.data = data; }
 }
 
 export class MemoryStorage {
@@ -55,6 +55,9 @@ export class ApiStorage {
 
   authenticate(uid, signSk) { this.id = { uid, signSk }; }
 
+  // Время по часам сервера: подписи и коды 2FA не зависят от того, как идут часы на этом ПК
+  now() { return Date.now() + this.skew; }
+
   async req(method, path, body = null, opts = {}) {
     const res = await this.send(method, path, body, opts);
     // Часы устройства сильно врут - повторяем один раз со временем сервера (оно уже учтено в skew)
@@ -68,7 +71,7 @@ export class ApiStorage {
     if (body != null) h['Content-Type'] = 'text/plain;charset=utf-8';
     if (sign && this.id) {
       // Подпись со временем сервера, а не устройства: у многих часы спешат или отстают
-      const ts = Date.now() + this.skew;
+      const ts = this.now();
       const sig = await signObj(this.id.signSk, requestPayload(method, '/' + path, ts, await sha256b64(body ?? '')));
       h['X-KB-Auth'] = `${this.id.uid}:${ts}:${sig}`;
     }
@@ -85,7 +88,7 @@ export class ApiStorage {
   }
 
   static fail(r, data) {
-    return new ApiError(r.status, data.error || 'Сервер ответил ' + r.status);
+    return new ApiError(r.status, data.error || 'Сервер ответил ' + r.status, data);
   }
 
   async status() {
@@ -204,6 +207,7 @@ export class CachedStorage {
   get invite() { return this.inner.invite; }
   set invite(v) { this.inner.invite = v; }
   authenticate(uid, signSk) { this.inner.authenticate?.(uid, signSk); }
+  now() { return this.inner.now?.() ?? Date.now(); }
 
   read(path) { return this.cached('f:' + path, () => this.inner.read(path)); }
   list(dir) { return this.cached('d:' + dir, () => this.inner.list(dir)); }

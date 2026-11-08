@@ -139,6 +139,8 @@ async function start() {
     navigator.serviceWorker.register('sw.js').catch(() => {});
   }
   if (!await C.checkSupport()) return screenUnsupported();
+  // Просим браузер не стирать данные Ключницы при нехватке места (иначе на новом входе снова нужна ссылка)
+  navigator.storage?.persist?.().catch(() => {});
   // Тестовый режим для разработки: только localhost, данные в памяти вкладки
   if (location.hash === '#demo' && ['localhost', '127.0.0.1'].includes(location.hostname)) {
     state.demo = true;
@@ -168,6 +170,7 @@ const codeDigits = code => String(code || '').replace(/\D/g, '');
 //   #setup=<код>                        - создать команду (один раз, ссылку даёт установщик)
 //   #t=<секрет команды>&c=<код команды> - вход в команду с нового устройства
 //   ...&i=<приглашение>                 - то же + заявка на вступление
+//   ...&u=<uid>                         - ссылка для своего устройства: сразу экран пароля, без «Кто вы?»
 function readLink() {
   const p = new URLSearchParams(location.hash.slice(1));
   if (!p.has('setup') && !p.has('t')) return;
@@ -182,11 +185,21 @@ function readLink() {
     LS.set('team', team);
   }
   if (p.has('i')) sessionSet('invite', p.get('i'));
+  if (V.isUid(p.get('u'))) sessionSet('uid', p.get('u'));
 }
 
-function teamLink(invite) {
+// Ссылку можно вставить прямо на экране входа, не трогая адресную строку
+function applyLink(text) {
+  const hash = String(text || '').trim().split('#')[1];
+  if (!hash || !/(^|&)(t|setup)=/.test(hash)) throw new Error('Это не ссылка Ключницы. Скопируйте ссылку целиком, вместе с частью после #.');
+  history.replaceState(null, '', location.pathname + '#' + hash);
+  start();
+}
+
+function teamLink(invite, uid) {
   const p = new URLSearchParams({ t: state.team.secret, c: state.team.code });
   if (invite) p.set('i', invite);
+  if (uid) p.set('u', uid);
   return location.origin + location.pathname + '#' + p;
 }
 
@@ -198,6 +211,7 @@ function forgetDevice() {
     }
   } catch { /* нет доступа */ }
   sessionSet('invite', null);
+  sessionSet('uid', null);
 }
 
 function screenUnsupported() {
@@ -205,8 +219,14 @@ function screenUnsupported() {
 }
 
 function screenNoTeam(message) {
+  const link = h('input', { required: true, placeholder: 'https://…#t=…', spellcheck: 'false', autocomplete: 'off', 'aria-label': 'Ссылка команды' });
   authCard('Нужна ссылка команды', message || 'Ключница открывается по ссылке от владельца или админа команды. Попросите её: раздел «Команда» → «Пригласить».',
-    h('p', { class: 'muted small' }, 'Если вы уже в команде и открыли Ключницу на новом устройстве, возьмите ссылку на старом: «Настройки» → «Вход с другого устройства».'));
+    h('form', {
+      onsubmit: e => { e.preventDefault(); run(async () => applyLink(link.value)); },
+    },
+    field('Вставьте ссылку', link),
+    h('button', { class: 'btn primary wide', type: 'submit' }, 'Продолжить')),
+    h('p', { class: 'muted small' }, 'Уже в команде и открыли Ключницу на новом устройстве? На старом: «Настройки» → «Ссылка для входа». С ней здесь сразу откроется ввод пароля.'));
 }
 
 async function screenEntry() {
@@ -231,7 +251,7 @@ async function screenEntry() {
   }
   state.orgName = r.org.name;
   if (state.storage.invite) return screenJoinForm(r.org);
-  const uid = LS.get('uid.' + r.org.orgId);
+  const uid = LS.get('uid.' + r.org.orgId) || sessionGet('uid');
   if (uid) return screenUnlock(uid, r.org);
   return screenWho(r.org);
 }
@@ -318,26 +338,56 @@ async function screenJoined(s) {
     h('button', { class: 'btn primary wide', onclick: () => run(() => enter(s)) }, 'Продолжить'));
 }
 
+// Даём браузеру отрисовать «Проверяю пароль…»: Argon2 занимает поток на 1-5 секунд, и без этого кнопка «замирает»
+const paint = () => new Promise(r => requestAnimationFrame(() => setTimeout(r, 0)));
+
+function capsWarning(input) {
+  const el = h('p', { class: 'warn small', hidden: true }, 'Включён Caps Lock');
+  const check = e => { if (e.getModifierState) el.hidden = !e.getModifierState('CapsLock'); };
+  input.addEventListener('keydown', check);
+  input.addEventListener('keyup', check);
+  return el;
+}
+
 function screenUnlock(uid, org) {
   const pw = passwordInput({ required: true, autocomplete: 'current-password' });
-  pw.input.setAttribute('autocomplete', 'current-password');
-  authCard('Разблокировать', org.name,
+  const status = h('p', { class: 'muted small center', role: 'status', 'aria-live': 'polite' });
+  const who = h('p', { class: 'muted small' });
+  authCard('Разблокировать', org.name, who,
     h('form', {
       onsubmit: e => {
         e.preventDefault();
         const btn = e.currentTarget.querySelector('button[type=submit]');
-        btn.textContent = 'Открываю…';
+        btn.textContent = 'Проверяю пароль…';
+        status.textContent = 'Обычно занимает пару секунд, на слабом ПК - до 10.';
+        pw.input.readOnly = true;
         run(async () => {
+          await paint();
           const s = await V.unlock(state.storage, uid, pw.input.value, V.localSeen);
           pw.input.value = '';
           LS.set('uid.' + s.orgId, uid);
+          sessionSet('uid', null);
+          status.textContent = 'Загружаю записи…';
           await enter(s);
-        }, btn).finally(() => { btn.textContent = 'Открыть'; pw.input.select(); });
+        }, btn).finally(() => {
+          btn.textContent = 'Открыть';
+          if (!state.session) { status.textContent = ''; pw.input.readOnly = false; pw.input.select(); }
+        });
       },
     },
-    field('Мастер-пароль', pw.el),
-    h('button', { class: 'btn primary wide', type: 'submit' }, 'Открыть')),
-    h('button', { class: 'btn link', onclick: () => { LS.del('uid.' + org.orgId); screenWho(org); } }, 'Войти другим участником'));
+    field('Мастер-пароль', [pw.el, capsWarning(pw.input)]),
+    h('button', { class: 'btn primary wide', type: 'submit' }, 'Открыть'),
+    status),
+    h('button', { class: 'btn link', onclick: () => { LS.del('uid.' + org.orgId); sessionSet('uid', null); screenWho(org); } }, 'Войти другим участником'));
+  showWho(uid, who);
+}
+
+// Показываем, под чьим именем вход: на чужом или новом ПК легко не заметить, что выбран не тот участник
+async function showWho(uid, el) {
+  try {
+    const p = (await V.listPeople(state.storage)).find(x => x.uid === uid);
+    if (p) el.textContent = 'Вы входите как ' + p.name;
+  } catch { /* не критично */ }
 }
 
 async function enter(s) {
@@ -606,7 +656,7 @@ function renderItem($d) {
     const ring = h('span', { class: 'totp-left' });
     const tick = async () => {
       try {
-        const t = await T.totpCode(it.totp);
+        const t = await T.totpCode(it.totp, state.storage?.now?.() ?? Date.now());
         code.textContent = t.code.replace(/(\d{3})(\d+)/, '$1 $2');
         code.dataset.code = t.code;
         ring.textContent = t.left + ' с';
@@ -974,9 +1024,9 @@ async function renderSettings() {
     h('h3', null, 'Это устройство'),
     h('div', { class: 'card pad' },
       state.demo ? h('p', { class: 'muted small' }, 'Демо-режим: данные живут только в этой вкладке.') : h('div', null,
-        h('p', { class: 'muted small' }, 'Вход с другого устройства: откройте там эту ссылку и войдите своим мастер-паролем. Ссылка не даёт доступа к паролям без мастер-пароля, но не публикуйте её.'),
+        h('p', { class: 'muted small' }, 'Вход с другого устройства: откройте там эту ссылку (или вставьте её на экране входа) и введите мастер-пароль. Ссылка личная: в ней ваше имя, поэтому выбирать себя из списка не придётся. Без мастер-пароля она не даёт доступа к паролям, но не публикуйте её.'),
         h('div', { class: 'gen-actions' },
-          h('button', { class: 'btn', onclick: () => copy(teamLink(), 'Ссылка скопирована', false) }, icon('copy'), 'Ссылка для входа'),
+          h('button', { class: 'btn', onclick: () => copy(teamLink(null, s.me.uid), 'Ссылка скопирована', false) }, icon('copy'), 'Ссылка для входа'),
           h('button', { class: 'btn danger ghost', onclick: e => run(async () => {
             if (!await confirmDialog('Забыть команду на этом устройстве?', 'Сохранённые на устройстве зашифрованные данные удалятся. Чтобы войти снова, понадобится ссылка команды. Данные на сервере останутся.', 'Забыть', true)) return;
             forgetDevice();

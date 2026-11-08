@@ -64,15 +64,23 @@ export async function deriveMasterKey(password, kdf) {
   if (!(kdf.m >= KDF_DEFAULT.m && kdf.m <= 262144 && kdf.t >= KDF_DEFAULT.t && kdf.t <= 10 && kdf.p >= 1 && kdf.p <= 4)) {
     throw new CryptoError('Недопустимые параметры ключа');
   }
-  return globalThis.hashwasm.argon2id({
-    password: password.normalize('NFC'),
-    salt: b64d(kdf.salt),
-    parallelism: kdf.p,
-    iterations: kdf.t,
-    memorySize: kdf.m,
-    hashLength: 32,
-    outputType: 'binary',
-  });
+  try {
+    return await globalThis.hashwasm.argon2id({
+      password: password.normalize('NFC'),
+      salt: b64d(kdf.salt),
+      parallelism: kdf.p,
+      iterations: kdf.t,
+      memorySize: kdf.m,
+      hashLength: 32,
+      outputType: 'binary',
+    });
+  } catch (e) {
+    // Ключу нужно 64 МБ памяти: на слабом ПК, в 32-битном браузере или при куче вкладок её может не хватить
+    if (e instanceof RangeError || /memory|памят/i.test(e?.message || '')) {
+      throw new CryptoError('Браузеру не хватило памяти для проверки пароля. Закройте лишние вкладки и попробуйте ещё раз или откройте Ключницу в другом браузере (Chrome, Edge, Firefox).');
+    }
+    throw e;
+  }
 }
 
 // Из мастер-ключа - два независимых подключа:
