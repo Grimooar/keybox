@@ -39,8 +39,17 @@ async function capture(msg, sender) {
   ext.alarms.create('kb-pending', { when: Date.now() + PENDING_MS });
 }
 
+// Кнопка в поле страницы: открыть окно Ключницы для этой вкладки (запись выбирает пользователь)
+function openFor(sender) {
+  const tab = sender.tab;
+  if (sender.id !== ext.runtime.id || !tab || !fillable(tab.url)) return;
+  ext.storage.session.set({ autofill: { tabId: tab.id, at: Date.now() } });
+  try { Promise.resolve(ext.action.openPopup()).catch(() => {}); } catch { /* старый браузер */ }
+}
+
 ext.runtime.onMessage.addListener((msg, sender) => {
   if (msg && msg.type === 'kb-capture') capture(msg, sender).catch(() => {});
+  if (msg && msg.type === 'kb-open') openFor(sender);
   return false;
 });
 

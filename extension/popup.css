@@ -87,3 +87,4 @@ textarea { resize: vertical; font-size: 12px; }
 label.check { flex-direction: row; align-items: center; gap: 8px; color: var(--text); }
 label.check input { width: auto; }
 @media (prefers-reduced-motion: reduce) { .meter span { transition: none; } }
+.search select { width: 100%; margin-bottom: 8px; }

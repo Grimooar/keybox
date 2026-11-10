@@ -39,7 +39,7 @@ function h(tag, attrs, ...children) {
   }
   return el;
 }
-const show = (...nodes) => app.replaceChildren(...nodes);
+const show = (...nodes) => app.replaceChildren(...nodes.filter(n => n != null && n !== false));
 const toastEl = h('div', { class: 'toast', role: 'status', 'aria-live': 'polite' });
 let toastT;
 function toast(msg, kind = '') {
@@ -237,7 +237,8 @@ async function quickFill() {
   try { await ext.storage.session.remove('autofill'); } catch { /* ignore */ }
   const tab = state.tab;
   if (Date.now() - (af.at || 0) > 10000 || !tab || af.tabId !== tab.id || !fillable(tab.url)) return false;
-  const m = state.session.allItems().filter(i => i.type === 'login' && itemMatches(i, tab.url));
+  const fl = LS.get('folder');
+  const m = state.session.allItems().filter(i => i.type === 'login' && (!fl || fl === 'all' || i.cid === fl) && itemMatches(i, tab.url));
   if (m.length !== 1) return false;
   const ok = await doFill(m[0]);
   if (ok) { window.close(); return true; }
@@ -390,12 +391,16 @@ function screenMain() {
   const s = state.session;
   const list = h('ul', { class: 'items', 'aria-label': 'Записи' });
   const tabUrl = state.tab && state.tab.url;
+  const cols = s.collections();
+  let folder = LS.get('folder');
+  if (folder !== 'all' && !cols.some(c => c.cid === folder)) folder = 'all';
+  const inFolder = i => folder === 'all' || i.cid === folder;
   const all = s.allItems().filter(i => i.type === 'login');
   let matchedNow = [];
   const render = () => {
     const q = state.search.trim().toLowerCase();
     const hit = i => !q || [i.name, i.username, ...(i.uris || [])].some(v => String(v || '').toLowerCase().includes(q));
-    const items = all.filter(hit);
+    const items = all.filter(i => inFolder(i) && hit(i));
     const m = tabUrl ? items.filter(i => itemMatches(i, tabUrl)) : [];
     const rest = items.filter(i => !m.includes(i)).sort((a, b) => String(a.name).localeCompare(String(b.name), 'ru'));
     matchedNow = m;
@@ -405,12 +410,17 @@ function screenMain() {
   const search = h('input', { type: 'search', placeholder: 'Поиск', 'aria-label': 'Поиск записей', value: state.search,
     oninput: e => { state.search = e.target.value; render(); touch(); },
     onkeydown: e => { if (e.key === 'Enter' && matchedNow.length === 1 && fillable(tabUrl)) { e.preventDefault(); doFill(matchedNow[0]); } } });
+  const folders = h('select', { 'aria-label': 'Папка', title: 'Из какой папки брать пароли',
+    onchange: e => { folder = e.target.value; LS.set('folder', folder); render(); touch(); } },
+  h('option', { value: 'all' }, 'Все папки'),
+  cols.map(c => h('option', { value: c.cid }, c.name || 'Без названия')));
+  folders.value = folder;
   show(h('header', { class: 'top' },
     h('span', { class: 'team' }, s.org && s.org.name || 'Ключница'),
     h('button', { class: 'icon', 'aria-label': 'Генератор паролей', title: 'Генератор паролей', onclick: screenGenerator }, '🎲'),
     h('button', { class: 'btn sm', onclick: lock }, 'Заблокировать'),
     h('button', { class: 'icon', 'aria-label': 'Настройки', title: 'Настройки', onclick: screenSettings }, '⚙')),
-  pendingBanner(), h('div', { class: 'search' }, search), list);
+  pendingBanner(), h('div', { class: 'search' }, folders, search), list);
   render();
   if (!state.pending) search.focus();
 }

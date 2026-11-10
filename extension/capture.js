@@ -73,4 +73,39 @@
   document.addEventListener('keydown', e => {
     if (e.key === 'Enter' && e.isTrusted && isPass(e.target)) grab(scopeOf(e.target));
   }, true);
+
+  // Кнопка «🔑» в полях логина и пароля. Секреты в страницу не попадают: клик только просит фон
+  // открыть окно Ключницы, где пользователь сам выбирает запись. Закрытый shadow DOM скрывает кнопку от скриптов сайта.
+  const host = document.createElement('div');
+  host.style.cssText = 'all:initial;position:fixed;z-index:2147483647;display:none';
+  const root = host.attachShadow({ mode: 'closed' });
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.textContent = '\u{1F511}';
+  btn.title = 'Ключница: подставить логин и пароль';
+  btn.style.cssText = 'all:initial;cursor:pointer;font:14px/22px sans-serif;width:24px;height:24px;text-align:center;background:#1c2230;color:#fff;border:1px solid #3a4258;border-radius:6px;box-shadow:0 1px 4px #0006';
+  root.append(btn);
+  let field = null;
+  const hide = () => { host.style.display = 'none'; field = null; };
+  const place = () => {
+    if (!field || !field.isConnected || !usable(field)) return hide();
+    const r = field.getBoundingClientRect();
+    host.style.left = Math.max(0, Math.min(r.right - 28, window.innerWidth - 28)) + 'px';
+    host.style.top = Math.max(0, r.top + (r.height - 24) / 2) + 'px';
+    host.style.display = 'block';
+  };
+  const loginField = el => el instanceof HTMLInputElement && usable(el) && (isPass(el) || (isUser(el) && scopeOf(el).querySelector && scopeOf(el).querySelector('input[type=password]')));
+  document.addEventListener('focusin', e => {
+    if (!loginField(e.target)) return;
+    field = e.target;
+    if (!host.isConnected) (document.body || document.documentElement).append(host);
+    place();
+  }, true);
+  document.addEventListener('focusout', () => setTimeout(() => { if (!host.matches(':hover')) hide(); }, 200), true);
+  addEventListener('scroll', place, true);
+  addEventListener('resize', place);
+  btn.addEventListener('click', e => {
+    if (!e.isTrusted) return;
+    try { ext.runtime.sendMessage({ type: 'kb-open' }).catch?.(() => {}); } catch { /* расширение перезагружено */ }
+  });
 })();
