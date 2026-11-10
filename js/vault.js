@@ -186,7 +186,7 @@ async function loginFile(storage, uid, password) {
   return meFromSecret(uid, file.name, secret);
 }
 
-async function meFromSecret(uid, name, secret) {
+export async function meFromSecret(uid, name, secret) {
   return {
     uid, name,
     boxPk: secret.boxPk, signPk: secret.signPk,
@@ -259,6 +259,14 @@ export async function joinTeam(storage, { userName, password, seen, expectedTeam
   return s;
 }
 
+// Восстановить сессию из ранее расшифрованных ключей (расширение: окно закрылось, браузер открыт)
+export async function resume(storage, uid, name, secret, seen) {
+  checkUid(uid);
+  const s = new Session(storage, await meFromSecret(uid, name, secret), seen);
+  await s.refresh();
+  return s;
+}
+
 export async function unlock(storage, uid, password, seen) {
   const me = await loginFile(storage, uid, password);
   const s = new Session(storage, me, seen);
@@ -321,6 +329,14 @@ export class Session {
     this.keys = new Map();   // cid -> { ver, key, old: { ver: key } }
     this.names = new Map();  // cid -> расшифрованное название
     this.vaults = new Map(); // cid -> { items, rev, error? }
+  }
+
+  // Блокировка: обнулить то, что можно обнулить (сырые ключи), и отпустить расшифрованные данные.
+  // CryptoKey стереть нельзя - они неизвлекаемые и уйдут вместе с объектом.
+  wipe() {
+    try { this.me?.personalKey?.fill?.(0); } catch { /* уже пусто */ }
+    for (const k of this.keys.values()) { try { k.key?.fill?.(0); for (const o of Object.values(k.old || {})) o?.fill?.(0); } catch { /* уже пусто */ } }
+    this.keys = new Map(); this.names = new Map(); this.vaults = new Map();
   }
 
   get orgId() { return this.me.pin.orgId; }

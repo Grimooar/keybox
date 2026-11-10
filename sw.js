@@ -1,10 +1,10 @@
 // Офлайн-оболочка: файлы приложения берём из сети, а без сети - из кэша.
 // Запросы к серверу здесь не кэшируются (их зашифрованный кэш ведёт само приложение).
 
-const CACHE = 'keybox-v8';
+const CACHE = 'keybox-v12';
 const FILES = [
   './', 'index.html', 'manifest.webmanifest', 'css/app.css',
-  'js/app.js', 'js/config.js', 'js/crypto.js', 'js/storage.js', 'js/tools.js', 'js/ui.js', 'js/vault.js',
+  'js/app.js', 'js/config.js', 'js/health.js', 'js/crypto.js', 'js/storage.js', 'js/tools.js', 'js/ui.js', 'js/vault.js', 'js/send.js', 'js/send-page.js', 'send.html', 'css/send.css',
   'vendor/argon2.umd.min.js', 'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png',
 ];
 
@@ -32,10 +32,11 @@ self.addEventListener('fetch', e => {
     e.respondWith(fresh(e.request).catch(() => caches.match('index.html')));
     return;
   }
+  const inFiles = FILES.some(f => new URL(f, location.href).pathname === url.pathname);
   e.respondWith(
     fresh(e.request)
       .then(r => {
-        if (r.ok) { const copy = r.clone(); caches.open(CACHE).then(c => c.put(e.request, copy)); }
+        if (r.ok && inFiles) { const copy = r.clone(); caches.open(CACHE).then(c => c.put(e.request, copy)); }
         return r;
       })
       .catch(() => caches.match(e.request).then(r => r || caches.match('index.html'))));

@@ -2,4 +2,4 @@
 // Сервер хранит только зашифрованные данные и проверяет подписи.
 export const API_URL = 'https://keybox-api.klyuchnitsa.workers.dev';
 
-export const APP_VERSION = '2.1.0';
+export const APP_VERSION = '2.2.0';

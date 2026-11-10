@@ -66,8 +66,28 @@ export class D1Store {
       RETURNING fails, window_start`).bind(key, now, windowMs).first();
   }
 
+  // Есть ли запись не старше windowMs (без увеличения счётчика)
+  async peekAttempt(key, now, windowMs) {
+    return !!await this.d1.prepare('SELECT 1 FROM attempts WHERE key = ? AND window_start > ?').bind(key, now - windowMs).first();
+  }
   async forgive(key) { await this.d1.prepare('UPDATE attempts SET fails = MAX(fails - 1, 0) WHERE key = ?').bind(key).run(); }
   async clearAttempts(key) { await this.d1.prepare('DELETE FROM attempts WHERE key = ?').bind(key).run(); }
+
+  // ---------- одноразовые ссылки (sends) ----------
+  async addSend(id, body, by, expires, views, now) {
+    await this.d1.batch([
+      this.d1.prepare('DELETE FROM sends WHERE expires_at <= ? OR views_left <= 0').bind(now),
+      this.d1.prepare('INSERT INTO sends (id, body, created_by, expires_at, views_left) VALUES (?, ?, ?, ?, ?)').bind(id, body, by, expires, views),
+    ]);
+  }
+  // Атомарно списать просмотр; последняя/просроченная запись удаляется
+  async takeSend(id, now) {
+    const r = await this.d1.prepare('UPDATE sends SET views_left = views_left - 1 WHERE id = ? AND views_left > 0 AND expires_at > ? RETURNING body, views_left').bind(id, now).first();
+    await this.d1.prepare('DELETE FROM sends WHERE expires_at <= ? OR views_left <= 0').bind(now).run();
+    return r || null;
+  }
+  async getSend(id) { return this.d1.prepare('SELECT id, created_by, expires_at, views_left FROM sends WHERE id = ?').bind(id).first(); }
+  async delSend(id) { await this.d1.prepare('DELETE FROM sends WHERE id = ?').bind(id).run(); }
 
   // Создание команды - всё или ничего (D1 batch выполняется одной транзакцией)
   async setupAll({ pin, teamHash, uid, userBody, authHash, orgBody }) {
@@ -88,7 +108,7 @@ export class D1Store {
 
 // То же самое в памяти - для тестов
 export class MemoryStore {
-  constructor() { this.files = new Map(); this.m = new Map(); this.auth = new Map(); this.invites = new Map(); this.attempts = new Map(); }
+  constructor() { this.files = new Map(); this.m = new Map(); this.auth = new Map(); this.invites = new Map(); this.attempts = new Map(); this.sends = new Map(); }
   async get(path) { const f = this.files.get(path); return f ? { ...f } : null; }
   async put(path, body, rev) {
     const f = this.files.get(path);
@@ -118,6 +138,7 @@ export class MemoryStore {
     else a.fails++;
     return { ...this.attempts.get(key) };
   }
+  async peekAttempt(key, now, windowMs) { const a = this.attempts.get(key); return !!a && a.window_start > now - windowMs; }
   async forgive(key) { const a = this.attempts.get(key); if (a) a.fails = Math.max(a.fails - 1, 0); }
   async clearAttempts(key) { this.attempts.delete(key); }
   async setupAll({ pin, teamHash, uid, userBody, authHash, orgBody }) {
@@ -129,4 +150,17 @@ export class MemoryStore {
     this.files.set('org.json', { body: orgBody, rev: 1 });
     return true;
   }
+
+  sweepSends(now) { for (const [k, v] of this.sends) if (v.expires_at <= now || v.views_left <= 0) this.sends.delete(k); }
+  async addSend(id, body, by, expires, views, now) { this.sweepSends(now); this.sends.set(id, { id, body, created_by: by, expires_at: expires, views_left: views }); }
+  async takeSend(id, now) {
+    const s = this.sends.get(id);
+    const ok = s && s.views_left > 0 && s.expires_at > now;
+    if (ok) s.views_left--;
+    const out = ok ? { body: s.body, views_left: s.views_left } : null;
+    this.sweepSends(now);
+    return out;
+  }
+  async getSend(id) { const s = this.sends.get(id); return s ? { ...s } : null; }
+  async delSend(id) { this.sends.delete(id); }
 }

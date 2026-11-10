@@ -199,7 +199,7 @@ await test('удаление участника: доступ пропадает
   // Старая сессия Боба: любой подписанный запрос отклоняется
   await rejects(bob.s.read('vault/' + general + '.json'), /Участник удалён/);
   await rejects(bob.saveItem(ads, item('После удаления')), /Участник удалён/);
-  await rejects(V.unlock(api(), bob.me.uid, 'bob-pass', dev()), /не найден/);
+  await rejects(V.unlock(api(), bob.me.uid, 'bob-pass', dev()), /Неверный мастер-пароль/);
   // Даже со старым ключом и подписью - сервер не примет (Боба нет в составе)
   assert.ok(oldKey.ver < owner.org.collections[ads].keyVersion);
 });
@@ -328,6 +328,60 @@ await test('аудит 5: сервер не может подсунуть осл
   assert.ok(!sent.some(u => u.includes('/api/login')), 'authKey не должен уйти на сервер');
 });
 
+await test('аудит-2 №1: перебор с многих адресов не запирает владельца на доверенном адресе', async () => {
+  db.attempts.clear();
+  await V.unlock(api(), owner.me.uid, 'owner-pass', dev()); // успешный вход с 'local'
+  for (let i = 0; i < 60; i++) await loginRaw(owner.me.uid, '7.7.' + (i % 10) + '.1');
+  assert.equal((await loginRaw(owner.me.uid, '9.9.9.9')).status, 429, 'общий лимит по uid работает');
+  assert.equal((await V.unlock(api(), owner.me.uid, 'owner-pass', dev())).role, 'owner');
+  db.attempts.clear();
+});
+
+await test('аудит-2 №2: prelogin не выдаёт существование участника', async () => {
+  const ghost = C.randomHex(16);
+  const a = await raw('GET', '/api/prelogin/' + ghost), b = await raw('GET', '/api/prelogin/' + ghost);
+  assert.equal(a.status, 200);
+  const ka = (await a.json()).kdf, kb = (await b.json()).kdf;
+  assert.deepEqual(ka, kb);
+  const real = (await (await raw('GET', '/api/prelogin/' + owner.me.uid)).json()).kdf;
+  assert.deepEqual(Object.keys(ka).sort(), Object.keys(real).sort());
+  assert.equal(ka.salt.length, real.salt.length);
+  const r = await loginRaw(ghost, '5.5.5.5');
+  assert.equal(r.status, 401);
+  assert.match((await r.json()).error, /Неверный мастер-пароль/);
+  db.attempts.clear();
+});
+
+await test('аудит-2 №3: подписанный изменяющий запрос нельзя повторить, старый ts отвергается', async () => {
+  const send = async ts => {
+    const body = '{}';
+    const sig = await C.signObj(owner.me.signSk, C.requestPayload('POST', '/api/invites', ts, await C.sha256b64(body)));
+    return { 'X-KB-Auth': `${owner.me.uid}:${ts}:${sig}`, body };
+  };
+  const h = await send(Date.now());
+  assert.equal((await raw('POST', '/api/invites', { body: h.body, headers: { 'X-KB-Auth': h['X-KB-Auth'] } })).status, 201);
+  const again = await raw('POST', '/api/invites', { body: h.body, headers: { 'X-KB-Auth': h['X-KB-Auth'] } });
+  assert.equal(again.status, 401);
+  const old = await send(Date.now() - 3 * 60 * 1000);
+  assert.equal((await raw('POST', '/api/invites', { body: old.body, headers: { 'X-KB-Auth': old['X-KB-Auth'] } })).status, 401);
+});
+
+await test('аудит-2 №4: CORS - чужой Origin не получает ACAO и не может писать, расширение может', async () => {
+  const evil = await raw('GET', '/api/people', { headers: { Origin: 'https://evil.example' } });
+  assert.equal(evil.headers.get('Access-Control-Allow-Origin'), null);
+  const post = await raw('POST', '/api/login', { body: '{}', headers: { Origin: 'https://evil.example' } });
+  assert.equal(post.status, 403);
+  const ok = await raw('GET', '/api/people', { headers: { Origin: 'https://grimooar.github.io' } });
+  assert.equal(ok.headers.get('Access-Control-Allow-Origin'), 'https://grimooar.github.io');
+  const ext = await raw('POST', '/api/login', { body: '{}', headers: { Origin: 'chrome-extension://abcdef' } });
+  assert.equal(ext.status, 400);
+  assert.equal(ext.headers.get('Access-Control-Allow-Origin'), 'chrome-extension://abcdef');
+  env.EXT_ORIGINS = 'moz-extension://good';
+  assert.equal((await raw('POST', '/api/login', { body: '{}', headers: { Origin: 'chrome-extension://abcdef' } })).status, 403);
+  assert.equal((await raw('POST', '/api/login', { body: '{}', headers: { Origin: 'moz-extension://good' } })).status, 400);
+  delete env.EXT_ORIGINS;
+});
+
 await test('аудит 4: новая ссылка команды отключает старую', async () => {
   await rejects(alice.s.rotateTeamSecret(C.b64e(C.randomBytes(24))), /только владелец/);
   const fresh = C.b64e(C.randomBytes(24));
@@ -345,5 +399,76 @@ await test('в базе сервера нет паролей и ключей в 
     assert.ok(!all.includes(s), 'нашлось: ' + s);
   }
 });
+
+// ---------- одноразовая отправка секрета ----------
+const S = await import('../js/send.js');
+const SEND_TEAM = C.b64e(C.randomBytes(24));
+await db.setMeta('team', await C.sha256b64(SEND_TEAM));
+const sendApi = who => { const a = new ApiStorage(BASE, SEND_TEAM, fetchFn); a.authenticate(who.me.uid, who.me.signSk); return a; };
+const anon = (method, id, headers = {}) => fetchFn(BASE + '/api/sends/' + id, { method, headers });
+const anonOpen = (id, key, ip = '9.9.9.' + Math.floor(Math.random() * 250)) => S.fetchSend(id, key, { apiUrl: BASE, fetchFn: (u, o) => fetchFn(u, { ...o, headers: { 'CF-Connecting-IP': ip } }) });
+const frag = link => S.parseFragment(new URL(link).hash);
+
+await test('отправка: ссылка открывается один раз, сервер видит только шифртекст', async () => {
+  const { link } = await S.createSend(sendApi(owner), 'секрет-123', { base: 'https://grimooar.github.io/keybox/' });
+  assert.match(link, /^https:\/\/grimooar\.github\.io\/keybox\/send\.html#[0-9a-f]{32}\.[A-Za-z0-9_-]{43}$/);
+  const { id, key } = frag(link);
+  assert.ok(!JSON.stringify([...db.sends.values()]).includes('секрет-123'));
+  const r = await anon('GET', id, { Origin: 'https://evil.example' });
+  assert.equal(r.headers.get('Access-Control-Allow-Origin'), '*');
+  const data = await r.json();
+  assert.equal(data.viewsLeft, 0);
+  assert.equal(await S.openSend(id, key, data.body), 'секрет-123');
+  assert.equal(await anonOpen(id, key), null);
+  assert.equal(db.sends.size, 0);
+});
+
+await test('отправка: несколько просмотров, 404 одинаковы для «не было» и «использована»', async () => {
+  const { link } = await S.createSend(sendApi(owner), 'x', { views: 2, base: BASE + '/' });
+  const { id, key } = frag(link);
+  assert.equal((await anonOpen(id, key)).viewsLeft, 1);
+  assert.equal((await anonOpen(id, key)).text, 'x');
+  const a = await anon('GET', id), b = await anon('GET', C.randomHex(16));
+  assert.equal(a.status, 404); assert.equal(b.status, 404);
+  assert.deepEqual(await a.json(), await b.json());
+});
+
+await test('отправка: истечение по времени (подставные часы)', async () => {
+  let t = Date.now();
+  env.now = () => t;
+  const { link } = await S.createSend(sendApi(owner), 'скоро исчезну', { ttlSec: 60, views: 5, base: BASE + '/' });
+  const { id, key } = frag(link);
+  t += 61 * 1000;
+  assert.equal(await anonOpen(id, key), null);
+  assert.equal(db.sends.size, 0);
+  delete env.now;
+});
+
+await test('отправка: права и проверки', async () => {
+  // без подписи и без секрета команды создать нельзя
+  assert.equal((await fetchFn(BASE + '/api/sends', { method: 'POST', body: '{"body":"x"}', headers: { 'X-KB-Team': SEND_TEAM } })).status, 401);
+  assert.equal((await fetchFn(BASE + '/api/sends', { method: 'POST', body: '{"body":"x"}' })).status, 403);
+  const a = sendApi(owner);
+  const bad = async b => (await a.req('POST', 'api/sends', JSON.stringify(b))).r.status;
+  assert.equal(await bad({ body: 'x', ttlSec: 10 }), 400);
+  assert.equal(await bad({ body: 'x', views: 11 }), 400);
+  assert.equal(await bad({ body: 'x'.repeat(20 * 1024 + 1) }), 413);
+  assert.equal(await bad({ body: 'x', id: 'zz' }), 400);
+  // удалить может создатель или админ; рядовой участник - нет
+  const org = JSON.parse((await db.get('org.json')).body);
+  const { id } = await S.createSend(a, 'del', { base: BASE + '/' });
+  const member = [alice, bob].find(x => x && org.members[x.me.uid]?.role === 'member');
+  if (member) assert.equal((await sendApi(member).req('DELETE', 'api/sends/' + id)).r.status, 403);
+  assert.equal((await a.req('DELETE', 'api/sends/' + id)).r.status, 200);
+  assert.equal((await anon('GET', id)).status, 404);
+});
+
+await test('отправка: лимит открытий с одного адреса', async () => {
+  const ip = '7.7.7.7';
+  let last;
+  for (let i = 0; i < 31; i++) last = await fetchFn(BASE + '/api/sends/' + C.randomHex(16), { headers: { 'CF-Connecting-IP': ip } });
+  assert.equal(last.status, 429);
+});
+
 
 console.log(`\n${passed} тестов прошло${process.exitCode ? ', есть ошибки' : ''}`);

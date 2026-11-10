@@ -5,6 +5,8 @@ import * as C from './crypto.js';
 import { ApiStorage, ApiError, CachedStorage, MemoryStorage, NetworkError } from './storage.js';
 import * as V from './vault.js';
 import * as T from './tools.js';
+import * as HL from './health.js';
+import * as SEND from './send.js';
 import { h, icon, iconBtn, clear, toast, modal, confirmDialog, field, formatDate, avatar } from './ui.js';
 
 const $app = document.getElementById('app');
@@ -49,6 +51,18 @@ async function run(fn, btn) {
 }
 
 let clipTimer = null;
+let clipText = null, clipAt = 0;
+// Очистка буфера, если с копирования прошло >= 30 с (вызывается и при blur/hidden/focus); без прав - молча
+async function clipSweep() {
+  if (!clipText || Date.now() - clipAt < 30000) return;
+  const t = clipText;
+  try {
+    if ((await navigator.clipboard.readText()) === t) await navigator.clipboard.writeText('');
+    clipText = null;
+  } catch {
+    try { if (document.hasFocus()) { await navigator.clipboard.writeText(''); clipText = null; } } catch { /* нет разрешения */ }
+  }
+}
 // secret = false - для ссылок и адресов: их не стираем из буфера
 async function copy(text, what = 'Скопировано', secret = true) {
   if (!text) return;
@@ -61,14 +75,8 @@ async function copy(text, what = 'Скопировано', secret = true) {
   if (!secret) return toast(what);
   toast(what + '. Буфер очистится через 30 с');
   clearTimeout(clipTimer);
-  clipTimer = setTimeout(async () => {
-    try {
-      if ((await navigator.clipboard.readText()) === text) await navigator.clipboard.writeText('');
-    } catch {
-      // Нет доступа на чтение - очищаем без проверки, если вкладка активна
-      if (document.hasFocus()) navigator.clipboard.writeText('').catch(() => {});
-    }
-  }, 30000);
+  clipText = text; clipAt = Date.now();
+  clipTimer = setTimeout(clipSweep, 30000);
 }
 
 function authCard(title, subtitle, ...body) {
@@ -136,7 +144,14 @@ async function start() {
     return;
   }
   if ('serviceWorker' in navigator && location.protocol !== 'file:') {
-    navigator.serviceWorker.register('sw.js').catch(() => {});
+    const hadController = !!navigator.serviceWorker.controller;
+    navigator.serviceWorker.register('sw.js').then(reg => {
+      // Новая версия приложения подтягивается сама: проверяем раз в полчаса и при возврате на вкладку
+      const check = () => reg.update().catch(() => {});
+      setInterval(check, 30 * 60000);
+      document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') check(); });
+    }).catch(() => {});
+    navigator.serviceWorker.addEventListener('controllerchange', () => { if (hadController) showUpdate(); });
   }
   if (!await C.checkSupport()) return screenUnsupported();
   // Просим браузер не стирать данные Ключницы при нехватке места (иначе на новом входе снова нужна ссылка)
@@ -404,7 +419,12 @@ async function enter(s) {
 }
 
 function lock() {
+  try { state.session?.wipe?.(); } catch { /* не мешаем блокировке */ }
   state.session = null;
+  knownPending = null;
+  pendingCount = 0;
+  document.title = 'Ключница';
+  if (state.updateReady) { location.reload(); return; } // пока ключница заперта, самое время обновиться
   state.editing = null;
   state.sel = null;
   clearTimers();
@@ -412,6 +432,7 @@ function lock() {
   if (clipTimer) {
     clearTimeout(clipTimer);
     clipTimer = null;
+    clipText = null;
     navigator.clipboard.writeText('').catch(() => {});
   }
   start();
@@ -452,11 +473,61 @@ async function sync(manual = false) {
 }
 
 let pendingCount = 0;
+let knownPending = null; // uid заявок, которые мы уже видели; null - ещё не смотрели (первый показ без шума)
 async function refreshPendingCount() {
   try {
-    pendingCount = (await state.session.pendingUsers()).length;
+    const list = await state.session.pendingUsers();
+    pendingCount = list.length;
+    if (knownPending) {
+      const fresh = list.filter(p => !knownPending.has(p.uid));
+      if (fresh.length) announceRequests(fresh);
+    }
+    knownPending = new Set(list.map(p => p.uid));
     renderNav();
+    setTitleBadge();
   } catch { /* не критично */ }
+}
+
+function setTitleBadge() {
+  document.title = (pendingCount && state.session?.isAdmin ? `(${pendingCount}) ` : '') + 'Ключница';
+}
+
+const notifyAllowed = () => LS.get('notify', false) && 'Notification' in window && Notification.permission === 'granted';
+
+// Имя пишет сам человек, поэтому показываем его только как текст и обрезаем
+function announceRequests(list) {
+  const names = list.map(p => String(p.name || 'Без имени').slice(0, 40)).join(', ');
+  const text = list.length === 1 ? `Новая заявка на вступление: ${names}` : `Новые заявки на вступление: ${names}`;
+  toast(text);
+  if (document.visibilityState !== 'visible' && notifyAllowed()) {
+    try { new Notification('Ключница', { body: text, tag: 'kb-join' }); } catch { /* нет прав */ }
+  }
+}
+
+// Лёгкая проверка без полной загрузки: файл команды (изменился - тогда полная синхронизация) и заявки у админа.
+// Работает и пока открыта форма редактирования: она ничего не перерисовывает.
+async function poll() {
+  const s = state.session;
+  if (!s || state.syncing || state.polling) return;
+  state.polling = true;
+  state.polledAt = Date.now();
+  try {
+    const r = await V.readOrg(s.s);
+    if (state.session !== s) return;
+    if (r && r.rev !== s.orgRev) await sync();
+    else if (s.isAdmin) await refreshPendingCount();
+    renderSyncStatus();
+  } catch { /* нет сети: следующая проверка попробует снова */ } finally {
+    state.polling = false;
+  }
+}
+
+function showUpdate() {
+  state.updateReady = true;
+  if (document.getElementById('upd')) return;
+  document.body.append(h('div', { id: 'upd', class: 'update-banner', role: 'status' },
+    h('span', null, 'Вышла новая версия Ключницы. После обновления нужно заново ввести пароль.'),
+    h('button', { class: 'btn small primary', onclick: () => location.reload() }, 'Обновить')));
 }
 
 // ---------- главный экран ----------
@@ -509,6 +580,8 @@ function renderNav() {
       s.vaults.get(c.cid)?.error ? h('span', { class: 'dot error', title: s.vaults.get(c.cid).error }) : null)),
     h('div', { class: 'nav-title' }, 'Инструменты'),
     link('generator', 'dice', 'Генератор'),
+    link('send', 'copy', 'Отправить секрет'),
+    link('health', 'shield', 'Проверка'),
     link('team', 'shield', 'Команда', null, pendingCount && s.isAdmin ? h('span', { class: 'badge' }, pendingCount) : null),
     link('settings', 'sliders', 'Настройки'),
     h('div', { class: 'nav-foot' },
@@ -534,9 +607,11 @@ function renderContent() {
   if (!$content) return;
   clear($content);
   $main.classList.toggle('show-detail', !!(state.sel || state.editing));
+  if (state.view === 'health') return renderHealth();
   if (state.view === 'team') return renderTeam();
   if (state.view === 'settings') return renderSettings();
   if (state.view === 'generator') return renderGenerator();
+  if (state.view === 'send') return renderSend();
   renderVault();
 }
 
@@ -769,6 +844,44 @@ function renderEditor($d) {
 
 const ROLE = { owner: 'Владелец', admin: 'Админ', member: 'Участник' };
 
+// ---------- проверка паролей ----------
+
+async function renderHealth() {
+  const s = state.session;
+  const body = h('div', { class: 'page-body' });
+  $content.append(h('section', { class: 'page' }, topBar('Проверка паролей'), body));
+  const r = await HL.analyze(s.allItems());
+  if (state.view !== 'health') return;
+  const open = it => { state.view = 'all'; state.sel = { cid: it.cid, id: it.id }; state.editing = null; state.reveal = false; renderNav(); renderContent(); };
+  const row = (it, note) => h('div', { class: 'member' },
+    h('div', { class: 'member-text' }, h('strong', null, it.name || 'Без названия'), h('span', { class: 'muted small' }, [it.username, note].filter(Boolean).join(' · '))),
+    h('button', { class: 'btn small', onclick: () => open(it) }, 'Открыть'));
+  const section = (title, hint, rows) => [h('h3', null, title), h('p', { class: 'muted small' }, hint),
+    rows.length ? h('div', { class: 'card' }, rows) : h('div', { class: 'card pad' }, h('span', { class: 'muted' }, 'Всё в порядке'))];
+  body.append(h('div', { class: 'card pad' },
+    h('p', null, `Проверено записей с паролем: ${r.total}`),
+    h('p', null, `Слабых: ${r.weak.length} · повторяющихся: ${r.reused.reduce((n, g) => n + g.length, 0)} · старых (больше ${HL.OLD_DAYS} дн.): ${r.old.length}`)));
+  body.append(...section('Слабые пароли', 'Легко подобрать. Замените на сгенерированные.', r.weak.map(x => row(x.item, x.score + ' бит'))));
+  body.append(...section('Повторяющиеся пароли', 'Один пароль на нескольких сайтах: утечка в одном месте открывает все.',
+    r.reused.map((g, i) => h('div', { class: 'card' }, h('div', { class: 'pad muted small' }, `Группа ${i + 1}: ${g.length} записи`), g.map(it => row(it))))));
+  body.append(...section('Старые пароли', `Не менялись больше ${HL.OLD_DAYS} дней.`, r.old.map(it => row(it, 'изменён ' + formatDate(it.updatedAt || it.createdAt)))));
+
+  const out = h('div'), prog = h('span', { class: 'muted small' });
+  const btn = h('button', { class: 'btn primary', onclick: async () => {
+    btn.disabled = true;
+    const all = s.allItems().filter(i => i.type === 'login' && i.password);
+    const res = await HL.checkBreaches(all, { onProgress: (d, n) => { prog.textContent = `Проверено ${d} из ${n}`; } });
+    btn.disabled = false;
+    const bad = [...res].filter(([, n]) => n > 0), fail = [...res].filter(([, n]) => n == null).length;
+    clear(out).append(
+      bad.length ? h('div', { class: 'card' }, bad.map(([it, n]) => row(it, `найден в утечках: ${n} раз`))) : h('div', { class: 'card pad' }, h('span', { class: 'muted' }, 'Утёкших паролей не найдено')),
+      fail ? h('p', { class: 'muted small' }, `Не удалось проверить: ${fail}. Проверьте сеть и повторите.`) : null);
+  } }, icon('shield'), 'Проверить на утечки');
+  body.append(h('h3', null, 'Утёкшие пароли'),
+    h('p', { class: 'muted small' }, 'Проверка по базе Have I Been Pwned. Наружу уходят только 5 символов хеша, пароль не отправляется. Запускается только по вашему клику.'),
+    h('div', { class: 'card pad' }, btn, ' ', prog), out);
+}
+
 async function renderTeam() {
   const s = state.session;
   const body = h('div', { class: 'page-body' });
@@ -976,6 +1089,35 @@ function renderGenerator() {
   make();
 }
 
+// ---------- одноразовая отправка секрета ----------
+
+function renderSend() {
+  const text = h('textarea', { rows: 5, maxlength: 10000, placeholder: 'Пароль, ключ или другой текст' });
+  const ttl = h('select', null, ...SEND.TTL_OPTIONS.map(([v, l]) => h('option', { value: v, selected: v === 86400 }, l)));
+  const views = h('input', { type: 'number', min: 1, max: 10, value: 1 });
+  const out = h('div', { class: 'gen-out mono', hidden: true });
+  const copyBtn = h('button', { class: 'btn', hidden: true, onclick: () => copy(out.textContent, 'Ссылка скопирована') }, icon('copy'), 'Копировать ссылку');
+  const create = h('button', { class: 'btn primary', onclick: async () => {
+    if (!text.value) return toast('Введите текст');
+    create.disabled = true;
+    try {
+      const n = Math.min(10, Math.max(1, Math.round(Number(views.value) || 1)));
+      const { link } = await SEND.createSend(state.storage, text.value, { ttlSec: Number(ttl.value), views: n, base: location.href });
+      out.textContent = link;
+      out.hidden = copyBtn.hidden = false;
+      text.value = '';
+    } catch (e) { toast(e.message); } finally { create.disabled = false; }
+  } }, 'Создать ссылку');
+  $content.append(h('section', { class: 'page' }, topBar('Отправить секрет'), h('div', { class: 'page-body narrow' },
+    h('div', { class: 'card pad' },
+      text,
+      h('label', null, 'Срок жизни ', ttl),
+      h('label', null, 'Число просмотров ', views),
+      h('div', { class: 'gen-actions' }, create),
+      out, copyBtn,
+      h('p', { class: 'muted small' }, 'Текст шифруется на этом устройстве, ключ есть только в ссылке. Ссылку увидит каждый, у кого она есть: отправляйте её только адресату. Получателю не нужен аккаунт.')))));
+}
+
 // ---------- настройки ----------
 
 async function renderSettings() {
@@ -1010,6 +1152,14 @@ async function renderSettings() {
     h('h3', null, 'Безопасность'),
     h('div', { class: 'card pad' },
       field('Блокировать при бездействии через', lockSel),
+      s.isAdmin && 'Notification' in window ? h('label', { class: 'check' },
+        h('input', { type: 'checkbox', checked: notifyAllowed(), onchange: async e => {
+          if (!e.target.checked) { LS.set('notify', false); return toast('Сохранено'); }
+          const p = await Notification.requestPermission();
+          if (p !== 'granted') { e.target.checked = false; return toast('Браузер не разрешил уведомления', 'error'); }
+          LS.set('notify', true); toast('Сохранено');
+        } }),
+        ' Сообщать о новых заявках системным уведомлением, когда вкладка в фоне') : null,
       h('button', { class: 'btn', onclick: () => changePasswordDialog() }, icon('key'), 'Сменить мастер-пароль')),
 
     h('h3', null, 'Импорт и экспорт'),
@@ -1089,8 +1239,10 @@ for (const ev of ['pointerdown', 'keydown', 'touchstart']) addEventListener(ev, 
 setInterval(() => {
   if (!state.session) return;
   if (Date.now() - lastActive > lockMinutes() * 60000) return lock();
-  if (document.visibilityState === 'visible' && !state.editing && Date.now() - state.syncedAt > 60000) sync();
-}, 10000);
+  const visible = document.visibilityState === 'visible';
+  if (visible && !state.editing && Date.now() - state.syncedAt > 60000) sync();
+  else if (Date.now() - (state.polledAt || 0) > (visible ? 20000 : 60000)) poll();
+}, 5000);
 
 // Ссылку команды вставили в уже открытую вкладку - страница не перезагружается, разбираем сами
 addEventListener('hashchange', () => {
@@ -1098,9 +1250,15 @@ addEventListener('hashchange', () => {
 });
 
 document.addEventListener('visibilitychange', () => {
+  clipSweep();
   if (!state.session || document.visibilityState !== 'visible') return;
   if (Date.now() - lastActive > lockMinutes() * 60000) return lock();
   if (Date.now() - state.syncedAt > 20000) sync();
+});
+addEventListener('blur', clipSweep);
+addEventListener('focus', () => {
+  clipSweep();
+  if (state.session && Date.now() - lastActive > lockMinutes() * 60000) lock();
 });
 
 start();

@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; connect-src https://keybox-api.klyuchnitsa.workers.dev; img-src 'self' data:; style-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <meta name="referrer" content="no-referrer">
+  <meta name="robots" content="noindex">
+  <meta name="theme-color" content="#4f46e5">
+  <title>Ключница - секрет для вас</title>
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="css/send.css">
+  <script type="module" src="js/send-page.js"></script>
+</head>
+<body>
+  <main class="send">
+    <h1>Вам отправили секрет</h1>
+    <section id="intro" hidden>
+      <p>Текст зашифрован, ключ есть только в вашей ссылке. После открытия ссылка может перестать работать.</p>
+      <button id="reveal" class="btn">Показать</button>
+    </section>
+    <section id="result" hidden>
+      <pre id="secret"></pre>
+      <button id="copy" class="btn">Копировать</button>
+      <p id="left" class="muted"></p>
+    </section>
+    <section id="gone" hidden><p>Ссылка недействительна или уже использована.</p></section>
+    <section id="error" hidden><p id="errmsg"></p></section>
+  </main>
+</body>
+</html>

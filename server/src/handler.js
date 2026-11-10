@@ -13,14 +13,28 @@ import { verifyOrg, accessOf, isUid } from '../../js/vault.js';
 const ORG = 'org.json';
 const MAX_BODY = 2 * 1024 * 1024;
 const MAX_USER = 32 * 1024;
-const CLOCK_SKEW = 5 * 60 * 1000;
+const CLOCK_SKEW = 2 * 60 * 1000;
+// Одноразовость подписей изменяющих запросов (в памяти изолята, на окно CLOCK_SKEW)
+const usedSigs = new Map();
+// С адреса, где недавно был успешный вход, общий лимит по участнику не запирает
+const TRUST_WINDOW = 30 * 24 * 3600 * 1000;
 const INVITE_TTL = 7 * 24 * 3600 * 1000;
 const INVITE_USES = 25;
+// Одноразовая отправка секрета: шифртекст (ключ только во фрагменте ссылки у получателя)
+const SEND_MAX = 20 * 1024;
+const SEND_TTL = { min: 60, max: 7 * 24 * 3600, def: 24 * 3600 };
+const SEND_VIEWS = { min: 1, max: 10, def: 1 };
+const SEND_GET_LIMIT = { max: 30, window: 60 * 1000 };       // открытий с одного адреса в минуту
+const SEND_NEW_LIMITS = [
+  { key: uid => `sendnew:${uid}`, max: 30, window: 60 * 60 * 1000 }, // на участника в час
+  { key: () => 'sendnew:*', max: 300, window: 60 * 60 * 1000 },      // на всю команду в час
+];
+const SEND_PATH = /^api\/sends\/([0-9a-f]{32})$/;
 // Подбор пароля: с одного адреса - 8 попыток за 15 минут; на участника всего - 50 в час.
 // Лимит по адресу не даёт постороннему запереть владельца, общий - ограничивает перебор с многих адресов.
 const LIMITS = [
   { key: (uid, ip) => `ip:${uid}:${ip}`, max: 8, window: 15 * 60 * 1000 },
-  { key: uid => `uid:${uid}`, max: 50, window: 60 * 60 * 1000 },
+  { key: uid => `uid:${uid}`, global: true, max: 50, window: 60 * 60 * 1000 },
 ];
 
 class HttpError extends Error {
@@ -48,9 +62,17 @@ function parseJson(text) {
 export async function handle(request, db, env) {
   const url = new URL(request.url);
   const origin = request.headers.get('Origin');
-  const allowed = (env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+  const list = v => (v || '').split(',').map(s => s.trim()).filter(Boolean);
+  const allowed = list(env.ALLOWED_ORIGINS);
+  const ext = list(env.EXT_ORIGINS);
+  // Расширение ходит с Origin chrome-extension:// / moz-extension://: по списку EXT_ORIGINS, а если он пуст - по схеме
+  const isExt = /^(chrome|moz)-extension:\/\//.test(origin || '');
+  const originOk = !origin || allowed.includes(origin) || (isExt && (ext.length ? ext.includes(origin) : true));
+  // Открыть отправленный секрет может кто угодно со ссылкой (без секрета команды и подписи):
+  // для этого одного GET-маршрута - открытый ACAO, остальное - как раньше по спискам
+  const openGet = request.method === 'GET' && SEND_PATH.test(url.pathname.replace(/^\/+/, ''));
   const cors = {
-    'Access-Control-Allow-Origin': allowed.includes(origin) ? origin : allowed[0] || 'null',
+    ...(openGet ? { 'Access-Control-Allow-Origin': '*' } : origin && originOk ? { 'Access-Control-Allow-Origin': origin } : {}),
     'Access-Control-Allow-Methods': 'GET, PUT, POST, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, X-KB-Team, X-KB-Auth, X-KB-Invite',
     'Access-Control-Expose-Headers': 'X-KB-Rev, X-KB-Time',
@@ -62,6 +84,7 @@ export async function handle(request, db, env) {
   });
 
   if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
+  if (!originOk && !['GET', 'HEAD'].includes(request.method)) return json(403, { error: 'Чужой источник запроса' });
   try {
     const res = await route(request, url, db, env);
     return json(res.status || 200, res.body ?? {}, res.rev != null ? { 'X-KB-Rev': String(res.rev) } : {});
@@ -89,6 +112,8 @@ async function route(request, url, db, env) {
     return { body: { team: !!(await db.meta('pin')) } };
   }
   if (path === 'api/setup' && method === 'POST') return setup(db, env, body);
+  const sendM = path.match(SEND_PATH);
+  if (sendM && method === 'GET') return openSend(db, env, sendM[1], request.headers.get('CF-Connecting-IP') || 'local');
 
   // Дальше - только с секретом команды
   const teamHash = await db.meta('team');
@@ -96,7 +121,7 @@ async function route(request, url, db, env) {
   if (!safeEqual(await sha(request.headers.get('X-KB-Team') || ''), teamHash)) fail(403, 'Неверная ссылка команды');
 
   const pin = JSON.parse(await db.meta('pin'));
-  const ctx = { db, pin, orgId: pin.orgId, ip: request.headers.get('CF-Connecting-IP') || 'local' };
+  const ctx = { db, env, pin, orgId: pin.orgId, ip: request.headers.get('CF-Connecting-IP') || 'local' };
   const orgRow = await db.get(ORG);
   ctx.org = JSON.parse(orgRow.body);
   ctx.orgRev = orgRow.rev;
@@ -115,6 +140,8 @@ async function route(request, url, db, env) {
 
   if (path === 'api/invites' && method === 'POST') return createInvite(ctx);
   if (path === 'api/team-secret' && method === 'POST') return rotateTeamSecret(ctx, body);
+  if (path === 'api/sends' && method === 'POST') return createSend(ctx, body);
+  if (sendM && method === 'DELETE') return deleteSend(ctx, sendM[1]);
   if (path === 'api/list/users' && method === 'GET') {
     requireAdmin(ctx);
     return { body: { names: (await db.list('users/')).map(p => p.slice(6)) } };
@@ -182,8 +209,20 @@ async function people(ctx) {
 async function prelogin(ctx, uid) {
   if (!isUid(uid)) fail(404, 'Участник не найден');
   const row = await ctx.db.get('users/' + uid);
-  if (!row) fail(404, 'Участник не найден. Возможно, его удалили из команды.');
+  // Несуществующему uid - детерминированная фиктивная соль: по ответу не понять, есть ли участник
+  if (!row) return { body: { kdf: await fakeKdf(ctx, uid) } };
   return { body: { kdf: JSON.parse(row.body).kdf } };
+}
+
+async function fakeKdf(ctx, uid) {
+  let secret = ctx.env.FAKE_SALT_SECRET || await ctx.db.meta('pepper');
+  if (!secret) {
+    await ctx.db.metaInit('pepper', C.b64e(C.randomBytes(32)));
+    secret = await ctx.db.meta('pepper');
+  }
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const mac = new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode('salt:' + uid)));
+  return { ...C.KDF_DEFAULT, salt: C.b64e(mac.slice(0, 16)) };
 }
 
 async function login(ctx, body) {
@@ -191,11 +230,12 @@ async function login(ctx, body) {
   if (!isUid(uid) || typeof authKey !== 'string' || authKey.length > 100) fail(400, 'Неверный запрос');
   const auth = await ctx.db.getAuth(uid);
   const row = await ctx.db.get('users/' + uid);
-  if (!auth || !row) fail(404, 'Участник не найден. Возможно, его удалили из команды.');
   // Попытка засчитывается ДО проверки пароля и атомарно - параллельный перебор не обходит лимит
   const now = Date.now();
   let left = Infinity;
+  const trusted = await ctx.db.peekAttempt(`ok:${uid}:${ctx.ip}`, now, TRUST_WINDOW);
   for (const l of LIMITS) {
+    if (l.global && trusted) continue;
     const a = await ctx.db.attempt(l.key(uid, ctx.ip), now, l.window);
     if (a.fails > l.max) {
       const wait = Math.max(1, Math.ceil((a.window_start + l.window - now) / 60000));
@@ -204,7 +244,9 @@ async function login(ctx, body) {
     left = Math.min(left, l.max - a.fails);
   }
   // left - сколько ещё попыток до блокировки: приложение предупреждает заранее
-  if (!safeEqual(await sha(authKey), auth.hash)) fail(401, 'Неверный мастер-пароль', { left });
+  // Несуществующий участник неотличим от неверного пароля (и тоже считается в лимит)
+  if (!auth || !row || !safeEqual(await sha(authKey), auth.hash)) fail(401, 'Неверный мастер-пароль', { left });
+  await ctx.db.attempt(`ok:${uid}:${ctx.ip}`, now, 0);
   await ctx.db.clearAttempts(LIMITS[0].key(uid, ctx.ip));
   await ctx.db.forgive(LIMITS[1].key(uid));
   return { body: { text: row.body }, rev: row.rev };
@@ -258,6 +300,12 @@ async function identify(ctx, request, method, fullPath, body) {
     role = 'pending';
   }
   if (!await C.verifyObj(pk, sig, C.requestPayload(method, fullPath, ts, await sha(body)))) fail(401, 'Подпись запроса неверна');
+  if (method !== 'GET') {
+    const now = Date.now();
+    for (const [k, exp] of usedSigs) if (exp < now) usedSigs.delete(k);
+    if (usedSigs.has(sig)) fail(401, 'Повтор запроса');
+    usedSigs.set(sig, Number(ts) + CLOCK_SKEW);
+  }
   return { uid, role, pk };
 }
 
@@ -368,5 +416,45 @@ async function deleteFile(ctx, file, uid, cid) {
     fail(409, 'Коллекция ещё используется');
   }
   await ctx.db.del('vault/' + cid);
+  return { body: { ok: true } };
+}
+
+// ---------- одноразовая отправка секрета ----------
+
+const sendNow = env => (typeof env?.now === 'function' ? env.now() : Date.now());
+const intIn = (v, r) => (v == null ? r.def : Number.isSafeInteger(v) && v >= r.min && v <= r.max ? v : fail(400, 'Неверные параметры ссылки'));
+
+async function createSend(ctx, body) {
+  if (ctx.me.role === 'pending') fail(403, 'Только для участников команды');
+  const req = parseJson(body);
+  if (typeof req?.body !== 'string' || !req.body || req.body.length > SEND_MAX) fail(413, 'Слишком большой текст');
+  const ttl = intIn(req.ttlSec, SEND_TTL);
+  const views = intIn(req.views, SEND_VIEWS);
+  const now = sendNow(ctx.env);
+  for (const l of SEND_NEW_LIMITS) {
+    const a = await ctx.db.attempt(l.key(ctx.me.uid), now, l.window);
+    if (a.fails > l.max) fail(429, 'Слишком много ссылок. Попробуйте позже.');
+  }
+  // id может предложить клиент (он нужен ему заранее как AD шифрования), иначе - случайный 128 бит
+  const id = req.id == null ? C.randomHex(16) : /^[0-9a-f]{32}$/.test(req.id) ? req.id : fail(400, 'Неверный id');
+  if (await ctx.db.getSend(id)) fail(409, 'Такая ссылка уже есть');
+  await ctx.db.addSend(id, req.body, ctx.me.uid, now + ttl * 1000, views, now);
+  return { status: 201, body: { id, expires: now + ttl * 1000 } };
+}
+
+// Без секрета команды: получатель вне команды. «Не было», «истекла», «уже открыта» - один и тот же 404.
+async function openSend(db, env, id, ip) {
+  const now = sendNow(env);
+  const a = await db.attempt(`sendget:${ip}`, now, SEND_GET_LIMIT.window);
+  if (a.fails > SEND_GET_LIMIT.max) fail(429, 'Слишком много запросов. Подождите минуту.');
+  const s = await db.takeSend(id, now);
+  if (!s) fail(404, 'Ссылка недействительна или уже использована');
+  return { body: { body: s.body, viewsLeft: s.views_left } };
+}
+
+async function deleteSend(ctx, id) {
+  const s = await ctx.db.getSend(id);
+  if (s && s.created_by !== ctx.me.uid) requireAdmin(ctx);
+  if (s) await ctx.db.delSend(id);
   return { body: { ok: true } };
 }
