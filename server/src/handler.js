@@ -8,7 +8,7 @@
 //   X-KB-Invite - токен приглашения (только для заявки на вступление)
 
 import * as C from '../../js/crypto.js';
-import { verifyOrg, accessOf, isUid } from '../../js/vault.js';
+import { verifyOrg, accessOf, isUid, isService, serviceConflict } from '../../js/vault.js';
 
 const ORG = 'org.json';
 const MAX_BODY = 2 * 1024 * 1024;
@@ -30,6 +30,26 @@ const SEND_NEW_LIMITS = [
   { key: () => 'sendnew:*', max: 300, window: 60 * 60 * 1000 },      // на всю команду в час
 ];
 const SEND_PATH = /^api\/sends\/([0-9a-f]{32})$/;
+// Журнал запросов: кто, что, когда. Только класс пути и объект - без тел, заголовков, параметров и id отправок
+// Строка - только запросу проверенного участника (подпись, верный пароль, принятая заявка) на известный путь;
+// остальное - счётчик за день (день, класс пути, код ответа): секрет команды есть у всех, включая удалённых,
+// и запросы с ним без подписи не должны вытеснять настоящие строки.
+// У каждого участника своя квота строк в сутки и свой потолок: вытесняются только его же старые строки.
+// Квота ограничивает чтения; записи и удаления (всё, кроме GET и входа) - своя квота, в разы выше.
+// Сверх квоты - одна отметка audit-quota[-write] и счётчик quota:<uid>:<путь>: видно, кто и что делал дальше.
+const AUDIT_DAYS = 180;
+const AUDIT_UID_DAY = 2000;   // чтений со строкой на участника в сутки
+const AUDIT_UID_WRITE_DAY = 10000; // записей и удалений со строкой на участника в сутки
+const AUDIT_UID_ROWS = 20000; // потолок строк одного участника (чистится раз в AUDIT_TRIM_EVERY его строк, см. db.js)
+const DAY = 24 * 3600 * 1000;
+const AUDIT_PAGE = { def: 200, max: 1000 };
+const AUDIT_FIXED = new Set(['api/setup', 'api/people', 'api/login', 'api/f/org.json', 'api/invites', 'api/team-secret', 'api/sends', 'api/list/users', 'api/audit']);
+const AUDIT_ROUTES = [
+  [/^api\/f\/vault\/((?:p-[0-9a-f]{32})|[0-9a-f]{24})\.json$/, 'api/f/vault/*'],
+  [/^api\/f\/users\/([0-9a-f]{32})\.json$/, 'api/f/users/*'],
+  [/^api\/prelogin\/([0-9a-f]{32})$/, 'api/prelogin/*'],
+  [/^api\/sends\/[0-9a-f]{32}$/, 'api/sends/*'],
+];
 // Подбор пароля: с одного адреса - 8 попыток за 15 минут; на участника всего - 50 в час.
 // Лимит по адресу не даёт постороннему запереть владельца, общий - ограничивает перебор с многих адресов.
 const LIMITS = [
@@ -53,7 +73,7 @@ function safeEqual(a, b) {
 
 const vaultPayload = (orgId, f) => ({ t: 'vault', orgId, cid: f.cid, keyVersion: f.keyVersion, seq: f.seq, data: f.data, signer: f.signer });
 const selfPayload = (f, orgId) => ({ t: 'user', orgId, uid: f.uid, name: f.name, boxPk: f.boxPk, signPk: f.signPk });
-const publicUser = f => ({ v: f.v, uid: f.uid, name: f.name, boxPk: f.boxPk, signPk: f.signPk, selfSig: f.selfSig, createdAt: f.createdAt });
+const publicUser = f => ({ v: f.v, uid: f.uid, name: f.name, boxPk: f.boxPk, signPk: f.signPk, selfSig: f.selfSig, createdAt: f.createdAt, ...(f.kind === 'service' ? { kind: 'service' } : {}) });
 
 function parseJson(text) {
   try { return JSON.parse(text); } catch { return fail(400, 'Неверный JSON'); }
@@ -84,15 +104,78 @@ export async function handle(request, db, env) {
   });
 
   if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
-  if (!originOk && !['GET', 'HEAD'].includes(request.method)) return json(403, { error: 'Чужой источник запроса' });
-  try {
-    const res = await route(request, url, db, env);
-    return json(res.status || 200, res.body ?? {}, res.rev != null ? { 'X-KB-Rev': String(res.rev) } : {});
-  } catch (e) {
-    if (e instanceof HttpError) return json(e.status, { ...e.extra, error: e.message });
-    console.error(e);
-    return json(500, { error: 'Ошибка сервера' });
+  // Для журнала, заполняет route: uid - кто (только проверенный: подпись, верный пароль, принятая заявка;
+  // без него - только счётчик), target - чей файл или вход
+  const who = { uid: null, target: null };
+  let response;
+  if (!originOk && !['GET', 'HEAD'].includes(request.method)) {
+    response = json(403, { error: 'Чужой источник запроса' });
+  } else {
+    try {
+      const res = await route(request, url, db, env, who);
+      response = json(res.status || 200, res.body ?? {}, res.rev != null ? { 'X-KB-Rev': String(res.rev) } : {});
+    } catch (e) {
+      if (e instanceof HttpError) response = json(e.status, { ...e.extra, error: e.message });
+      else {
+        // Только имя и место ошибки: в тексте исключения может оказаться кусок запроса
+        console.error('Ошибка сервера:', e?.name, String(e?.stack || '').split('\n').slice(1, 4).join(' | '));
+        response = json(500, { error: 'Ошибка сервера' });
+      }
+    }
   }
+  await audit(db, env, request, url, who, response.status);
+  return response;
+}
+
+const envInt = (v, def) => (Number.isSafeInteger(Number(v)) && Number(v) > 0 ? Number(v) : def);
+
+// Строка журнала. Ошибка журнала (например, таблицы ещё нет после деплоя) запрос не ломает,
+// но и не теряется молча: считается в audit_denied как audit-error:<путь>.
+async function audit(db, env, request, url, who, status) {
+  const path = url.pathname.replace(/^\/+/, '');
+  if (path === 'api/status' || !db.addAudit) return;
+  let routeName = AUDIT_FIXED.has(path) ? path : 'other';
+  let target = null;
+  for (const [re, name] of AUDIT_ROUTES) {
+    const m = path.match(re);
+    if (m) { routeName = name; target = m[1] ?? null; break; }
+  }
+  if (isUid(who.target)) target = who.target;
+  const now = sendNow(env);
+  const before = now - envInt(env.AUDIT_DAYS, AUDIT_DAYS) * DAY;
+  const count = route => db.countDenied({ day: Math.floor(now / DAY), route, status }, Math.floor(before / DAY));
+  try {
+    if (!isUid(who.uid) || routeName === 'other') return await count(routeName);
+    // Адрес - HMAC с AUDIT_SALT из секретов Workers (не из базы: по дампу базы IPv4 перебирается за минуты).
+    // Без AUDIT_SALT адрес пустой ('' - столбец NOT NULL DEFAULT '' в любой версии схемы).
+    const ip = request.headers.get('CF-Connecting-IP') || 'local';
+    const ipHash = env.AUDIT_SALT ? await hmacB64(env.AUDIT_SALT, 'ip:' + ip, 12) : '';
+    const write = request.method !== 'GET' && routeName !== 'api/login';
+    const res = await db.addAudit({ ts: now, uid: who.uid, method: request.method.slice(0, 8), route: routeName, target, status, ip: ipHash }, {
+      before, write, perDay: envInt(env.AUDIT_UID_DAY, AUDIT_UID_DAY), writeDay: envInt(env.AUDIT_UID_WRITE_DAY, AUDIT_UID_WRITE_DAY),
+      keep: envInt(env.AUDIT_UID_ROWS, AUDIT_UID_ROWS), trimEvery: envInt(env.AUDIT_TRIM_EVERY, undefined),
+    });
+    if (res === 'quota') await count(`quota:${who.uid}:${routeName}`);
+  } catch (e) {
+    console.error('Журнал не записан:', e?.name);
+    try { await count('audit-error:' + routeName); } catch { /* таблицы журнала нет вовсе - запрос всё равно отвечает */ }
+  }
+}
+
+async function hmacB64(secret, text, bytes = 32) {
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const mac = new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(text)));
+  return C.b64e(mac.slice(0, bytes));
+}
+
+// Секрет сервера: создаётся при первом обращении и не покидает базу
+async function serverPepper(db, env) {
+  let secret = env.FAKE_SALT_SECRET || await db.meta('pepper');
+  if (!secret) {
+    await db.metaInit('pepper', C.b64e(C.randomBytes(32)));
+    secret = await db.meta('pepper');
+  }
+  return secret;
 }
 
 async function readBody(request) {
@@ -103,7 +186,7 @@ async function readBody(request) {
   return body;
 }
 
-async function route(request, url, db, env) {
+async function route(request, url, db, env, who = {}) {
   const path = url.pathname.replace(/^\/+/, '');
   const method = request.method;
   const body = await readBody(request);
@@ -111,11 +194,12 @@ async function route(request, url, db, env) {
   if (path === 'api/status' && method === 'GET') {
     return { body: { team: !!(await db.meta('pin')) } };
   }
-  if (path === 'api/setup' && method === 'POST') return setup(db, env, body);
+  // Удачное создание команды - строка от имени владельца; открытие отправки (кем угодно по ссылке) - только счётчик
+  if (path === 'api/setup' && method === 'POST') return setup(db, env, body, who);
   const sendM = path.match(SEND_PATH);
   if (sendM && method === 'GET') return openSend(db, env, sendM[1], request.headers.get('CF-Connecting-IP') || 'local');
 
-  // Дальше - только с секретом команды
+  // Дальше - только с секретом команды (сам по себе он строку журнала не даёт: он есть у всех)
   const teamHash = await db.meta('team');
   if (!teamHash) fail(404, 'Команда ещё не создана');
   if (!safeEqual(await sha(request.headers.get('X-KB-Team') || ''), teamHash)) fail(403, 'Неверная ссылка команды');
@@ -128,20 +212,25 @@ async function route(request, url, db, env) {
 
   if (path === 'api/people' && method === 'GET') return people(ctx);
   if (path.startsWith('api/prelogin/') && method === 'GET') return prelogin(ctx, path.slice(13));
-  if (path === 'api/login' && method === 'POST') return login(ctx, body);
+  if (path === 'api/login' && method === 'POST') return login(ctx, body, who);
   if (path === 'api/f/org.json' && method === 'GET') return { body: { text: orgRow.body }, rev: orgRow.rev };
   const join = path.match(/^api\/f\/users\/([0-9a-f]{32})\.json$/);
   if (join && method === 'PUT' && request.headers.get('X-KB-Invite')) {
-    return joinRequest(ctx, join[1], body, request.headers.get('X-KB-Invite'));
+    // uid заявки при отказе - только в target (из пути); «кто» - лишь когда сервер заявку принял
+    const res = await joinRequest(ctx, join[1], body, request.headers.get('X-KB-Invite'));
+    who.uid = join[1];
+    return res;
   }
 
   // Дальше - только подписанные запросы участников или заявок
   ctx.me = await identify(ctx, request, method, url.pathname + url.search, body);
+  who.uid = ctx.me.uid;
 
   if (path === 'api/invites' && method === 'POST') return createInvite(ctx);
   if (path === 'api/team-secret' && method === 'POST') return rotateTeamSecret(ctx, body);
   if (path === 'api/sends' && method === 'POST') return createSend(ctx, body);
   if (sendM && method === 'DELETE') return deleteSend(ctx, sendM[1]);
+  if (path === 'api/audit' && method === 'GET') return readAudit(ctx, url);
   if (path === 'api/list/users' && method === 'GET') {
     requireAdmin(ctx);
     return { body: { names: (await db.list('users/')).map(p => p.slice(6)) } };
@@ -163,7 +252,7 @@ async function route(request, url, db, env) {
 
 // ---------- создание команды (один раз, по коду из настроек сервера) ----------
 
-async function setup(db, env, body) {
+async function setup(db, env, body, who) {
   if (await db.meta('pin')) fail(409, 'Команда уже создана');
   const req = parseJson(body);
   if (!env.SETUP_CODE || !safeEqual(String(req.setupCode || ''), env.SETUP_CODE)) fail(403, 'Неверный код установки');
@@ -180,6 +269,7 @@ async function setup(db, env, body) {
   const { authHash, ...stored } = user;
   const ok = await db.setupAll({ pin: JSON.stringify(pin), teamHash: req.teamHash, uid: user.uid, userBody: JSON.stringify(stored), authHash, orgBody: req.org });
   if (!ok) fail(409, 'Команда уже создана');
+  who.uid = user.uid;
   return { status: 201, body: { ok: true } };
 }
 
@@ -215,19 +305,14 @@ async function prelogin(ctx, uid) {
 }
 
 async function fakeKdf(ctx, uid) {
-  let secret = ctx.env.FAKE_SALT_SECRET || await ctx.db.meta('pepper');
-  if (!secret) {
-    await ctx.db.metaInit('pepper', C.b64e(C.randomBytes(32)));
-    secret = await ctx.db.meta('pepper');
-  }
-  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  const mac = new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode('salt:' + uid)));
-  return { ...C.KDF_DEFAULT, salt: C.b64e(mac.slice(0, 16)) };
+  return { ...C.KDF_DEFAULT, salt: await hmacB64(await serverPepper(ctx.db, ctx.env), 'salt:' + uid, 16) };
 }
 
-async function login(ctx, body) {
+async function login(ctx, body, who) {
   const { uid, authKey } = parseJson(body);
   if (!isUid(uid) || typeof authKey !== 'string' || authKey.length > 100) fail(400, 'Неверный запрос');
+  // Чей вход пробуют - в target; uid («кто») - только после верного пароля, иначе любой впишет в журнал чужое имя
+  who.target = uid;
   const auth = await ctx.db.getAuth(uid);
   const row = await ctx.db.get('users/' + uid);
   // Попытка засчитывается ДО проверки пароля и атомарно - параллельный перебор не обходит лимит
@@ -249,6 +334,7 @@ async function login(ctx, body) {
   await ctx.db.attempt(`ok:${uid}:${ctx.ip}`, now, 0);
   await ctx.db.clearAttempts(LIMITS[0].key(uid, ctx.ip));
   await ctx.db.forgive(LIMITS[1].key(uid));
+  who.uid = uid;
   return { body: { text: row.body }, rev: row.rev };
 }
 
@@ -258,6 +344,9 @@ async function joinRequest(ctx, uid, body, token) {
   const f = parseJson(body);
   await checkNewUser(f, uid, ctx.orgId, body);
   if (Object.hasOwn(ctx.org.members, uid) || await ctx.db.get('users/' + uid)) fail(409, 'Уже есть');
+  // uid удалённого участника или отклонённой заявки не занять: иначе новый человек получил бы его журнал и квоту.
+  // До списания приглашения - отказ его не тратит
+  if (await ctx.db.isRetired(uid)) fail(409, 'Этот uid уже был в команде: создайте заявку заново');
   if (!await ctx.db.useInvite(await sha(token), Date.now())) fail(403, 'Приглашение недействительно или истекло. Попросите новое.');
   const { authHash, ...stored } = f;
   const rev = await ctx.db.put('users/' + uid, JSON.stringify(stored), null);
@@ -306,7 +395,12 @@ async function identify(ctx, request, method, fullPath, body) {
     if (usedSigs.has(sig)) fail(401, 'Повтор запроса');
     usedSigs.set(sig, Number(ts) + CLOCK_SKEW);
   }
-  return { uid, role, pk };
+  return { uid, role, pk, service: role === 'member' && isService(ctx.org.members[uid]) };
+}
+
+// Участнику-сервису - только коллекции, куда его добавили: без личного сейфа, отправок и чужих файлов
+function denyService(ctx, what) {
+  if (ctx.me.service) fail(403, 'Участнику-сервису нельзя: ' + what);
 }
 
 function requireAdmin(ctx) {
@@ -314,7 +408,7 @@ function requireAdmin(ctx) {
 }
 
 function canReadVault(ctx, cid) {
-  if (cid.startsWith('p-')) return cid.slice(2) === ctx.me.uid;
+  if (cid.startsWith('p-')) return cid.slice(2) === ctx.me.uid && !ctx.me.service;
   const col = ctx.org.collections[cid];
   return !!col && ctx.me.role !== 'pending' && accessOf(ctx.org, col).includes(ctx.me.uid);
 }
@@ -329,6 +423,7 @@ async function readFile(ctx, file, uid, cid) {
     // Зашифрованные ключи - только самому участнику; остальным - публичная часть (для одобрения заявки)
     if (uid === ctx.me.uid) return { body: { text: row.body }, rev: row.rev };
     if (ctx.me.role === 'pending') fail(403, 'Нет доступа');
+    denyService(ctx, 'файлы других участников');
     return { body: { text: JSON.stringify(publicUser(JSON.parse(row.body))) }, rev: row.rev };
   }
   if (!canReadVault(ctx, cid)) fail(403, 'Нет доступа к коллекции');
@@ -353,9 +448,16 @@ async function writeOrg(ctx, body, rev) {
   requireAdmin(ctx);
   if (rev == null || rev !== ctx.orgRev) fail(409, 'Файл изменился, обновите данные');
   const next = parseJson(body);
+  // До проверки подписи: понятная ошибка вместо «подделан», если старый клиент выдал сервису ключ «для всех»
+  const conflict = serviceConflict(next);
+  if (conflict) fail(400, conflict);
   const seen = { get: () => ({ version: ctx.org.version + 1, certVersion: ctx.org.adminCert.certVersion }) };
   await verifyOrg(next, ctx.pin, seen).catch(e => fail(400, 'Файл команды не прошёл проверку: ' + e.message));
   if (next.signer !== ctx.me.uid) fail(400, 'Подписано не вами');
+  // Сервис остаётся сервисом: расширить ему права нельзя, только удалить и принять заново
+  for (const [uid, m] of Object.entries(ctx.org.members)) {
+    if (isService(m) && Object.hasOwn(next.members, uid) && !isService(next.members[uid])) fail(400, 'Участник-сервис «' + m.name + '» не может стать обычным участником');
+  }
   // Ключи каждого участника - те, что он сам прислал при вступлении (файл участника меняет только он).
   // Так админ не может подставить свой ключ вместо чужого и действовать от имени участника.
   for (const [uid, m] of Object.entries(next.members)) {
@@ -387,6 +489,7 @@ async function writeVault(ctx, cid, body, rev) {
   const f = parseJson(body);
   if (f.cid !== cid || f.signer !== ctx.me.uid || !Number.isSafeInteger(f.seq) || !Number.isSafeInteger(f.keyVersion)) fail(400, 'Неверный файл коллекции');
   if (cid.startsWith('p-')) {
+    denyService(ctx, 'личный сейф');
     if (cid.slice(2) !== ctx.me.uid || f.keyVersion !== 1) fail(403, 'Чужой личный сейф');
   } else {
     if (!canReadVault(ctx, cid)) fail(403, 'Нет доступа к коллекции');
@@ -407,6 +510,8 @@ async function deleteFile(ctx, file, uid, cid) {
   if (file === ORG) fail(403, 'Файл команды не удаляется');
   if (uid) {
     if (Object.hasOwn(ctx.org.members, uid)) fail(409, 'Сначала удалите участника из команды');
+    // Сначала погасить uid: если дальше что-то упадёт, занять его заново всё равно нельзя
+    await ctx.db.retireUid(uid, Date.now());
     await ctx.db.del('users/' + uid);
     await ctx.db.delAuth(uid);
     await ctx.db.del('vault/p-' + uid);
@@ -419,6 +524,23 @@ async function deleteFile(ctx, file, uid, cid) {
   return { body: { ok: true } };
 }
 
+// ---------- журнал ----------
+
+// Владелец и админы видят весь журнал, участник - только свои запросы (сервис сверяет свой журнал)
+async function readAudit(ctx, url) {
+  if (ctx.me.role === 'pending') fail(403, 'Только для участников команды');
+  const num = (k, def) => (url.searchParams.has(k) ? Number(url.searchParams.get(k)) : def);
+  const after = num('after', 0), since = num('since', 0), limit = num('limit', AUDIT_PAGE.def);
+  if (![after, since, limit].every(Number.isSafeInteger) || after < 0 || since < 0 || limit < 1) fail(400, 'Неверные параметры');
+  const uid = ['owner', 'admin'].includes(ctx.me.role) ? null : ctx.me.uid;
+  const rows = await ctx.db.listAudit({ uid, after, since, limit: Math.min(limit, AUDIT_PAGE.max) });
+  // Счётчик запросов без строки журнала (без проверенного участника, неизвестный путь, сверх квоты - quota:<uid>:<путь>)
+  // и запросы участников за сутки (n_day - чтения, w_day - записи, вместе со сверхквотными) - только владельцу и админам
+  if (uid !== null) return { body: { rows } };
+  const sinceDay = Math.floor(since / DAY);
+  return { body: { rows, denied: await ctx.db.listDenied({ sinceDay }), counts: await ctx.db.listAuditCount({ sinceDay }) } };
+}
+
 // ---------- одноразовая отправка секрета ----------
 
 const sendNow = env => (typeof env?.now === 'function' ? env.now() : Date.now());
@@ -426,6 +548,7 @@ const intIn = (v, r) => (v == null ? r.def : Number.isSafeInteger(v) && v >= r.m
 
 async function createSend(ctx, body) {
   if (ctx.me.role === 'pending') fail(403, 'Только для участников команды');
+  denyService(ctx, 'отправка секрета');
   const req = parseJson(body);
   if (typeof req?.body !== 'string' || !req.body || req.body.length > SEND_MAX) fail(413, 'Слишком большой текст');
   const ttl = intIn(req.ttlSec, SEND_TTL);

@@ -1,6 +1,9 @@
 // Хранилище сервера. put(path, body, rev) - запись «если версия не изменилась»:
 // rev = null - только создать; возвращает новую версию или null при конфликте.
 
+const DAY = 24 * 3600 * 1000;
+const AUDIT_TRIM_EVERY = 256; // потолок строк участника проверяется раз в столько его строк
+
 export class D1Store {
   constructor(d1) { this.d1 = d1; }
 
@@ -89,6 +92,65 @@ export class D1Store {
   async getSend(id) { return this.d1.prepare('SELECT id, created_by, expires_at, views_left FROM sends WHERE id = ?').bind(id).first(); }
   async delSend(id) { await this.d1.prepare('DELETE FROM sends WHERE id = ?').bind(id).run(); }
 
+  // ---------- журнал запросов ----------
+  // Строка проверенного участника. Квота и потолок - на uid: счётчик в audit_count (строка на участника).
+  // Два класса со своей суточной квотой: чтения (n_day, perDay) и записи/удаления (w_day, writeDay - выше).
+  // Сверх квоты класса за сутки - одна отметка audit-quota[-write] и дальше ничего ('quota': счётчик ведёт handler.js).
+  // n_all - сколько строк участника записано (сверхквотные не считаются), по нему раз в trimEvery строк - чистка
+  // сверх keep строк этого же участника (по индексу uid, id); старше срока - по индексу ts
+  async addAudit(r, { before, perDay, writeDay = perDay, write = false, keep, trimEvery = AUDIT_TRIM_EVERY }) {
+    const limit = write ? writeDay : perDay;
+    const c = await this.d1.prepare(`INSERT INTO audit_count (uid, day, n_day, w_day, n_all) VALUES (?1, ?2, ?3, ?4, 1)
+      ON CONFLICT (uid) DO UPDATE SET
+        n_day = CASE WHEN day = ?2 THEN n_day ELSE 0 END + ?3,
+        w_day = CASE WHEN day = ?2 THEN w_day ELSE 0 END + ?4,
+        n_all = n_all + CASE WHEN (CASE WHEN day = ?2 THEN (CASE WHEN ?4 = 1 THEN w_day ELSE n_day END) ELSE 0 END) < ?5 THEN 1 ELSE 0 END,
+        day = ?2
+      RETURNING n_day, w_day, n_all`).bind(r.uid, Math.floor(r.ts / DAY), write ? 0 : 1, write ? 1 : 0, limit + 1).first();
+    const n = write ? c.w_day : c.n_day;
+    if (n > limit + 1) return 'quota';
+    const row = n > limit ? { ...r, route: write ? 'audit-quota-write' : 'audit-quota', target: null } : r;
+    const list = [
+      this.d1.prepare('INSERT INTO audit (ts, uid, method, route, target, status, ip) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .bind(row.ts, row.uid, row.method, row.route, row.target, row.status, row.ip),
+      this.d1.prepare('DELETE FROM audit WHERE ts < ?').bind(before),
+    ];
+    if (c.n_all % trimEvery === 0) {
+      list.push(this.d1.prepare('DELETE FROM audit WHERE uid = ?1 AND id <= (SELECT id FROM audit WHERE uid = ?1 ORDER BY id DESC LIMIT 1 OFFSET ?2)').bind(r.uid, keep));
+    }
+    await this.d1.batch(list);
+    return row === r ? 'row' : 'quota';
+  }
+  // Сколько запросов участники сделали за сутки (чтения и записи, со сверхквотными) - для владельца и админов
+  async listAuditCount({ sinceDay }) {
+    const { results } = await this.d1.prepare('SELECT uid, day, n_day, w_day FROM audit_count WHERE day >= ? ORDER BY uid').bind(sinceDay).all();
+    return results;
+  }
+  // Удалённый участник: его uid не займёт никто (заявка с ним отклоняется), строки журнала и квота остаются его
+  async retireUid(uid, at) {
+    await this.d1.prepare('INSERT INTO retired_uids (uid, at) VALUES (?, ?) ON CONFLICT(uid) DO NOTHING').bind(uid, at).run();
+  }
+  async isRetired(uid) {
+    return !!await this.d1.prepare('SELECT 1 FROM retired_uids WHERE uid = ?').bind(uid).first();
+  }
+  // Запросы без строки журнала - счётчик на (день, класс пути, код): таблица растёт не быстрее числа дней
+  async countDenied({ day, route, status }, beforeDay) {
+    await this.d1.batch([
+      this.d1.prepare(`INSERT INTO audit_denied (day, route, status, n) VALUES (?, ?, ?, 1)
+        ON CONFLICT (day, route, status) DO UPDATE SET n = n + 1`).bind(day, route, status),
+      this.d1.prepare('DELETE FROM audit_denied WHERE day < ?').bind(beforeDay),
+    ]);
+  }
+  async listDenied({ sinceDay }) {
+    const { results } = await this.d1.prepare('SELECT day, route, status, n FROM audit_denied WHERE day >= ? ORDER BY day, route, status').bind(sinceDay).all();
+    return results;
+  }
+  async listAudit({ uid, after, since, limit }) {
+    const { results } = await this.d1.prepare(`SELECT id, ts, uid, method, route, target, status, ip FROM audit
+      WHERE id > ?1 AND ts >= ?2 AND (?3 IS NULL OR uid = ?3) ORDER BY id LIMIT ?4`).bind(after, since, uid, limit).all();
+    return results;
+  }
+
   // Создание команды - всё или ничего (D1 batch выполняется одной транзакцией)
   async setupAll({ pin, teamHash, uid, userBody, authHash, orgBody }) {
     try {
@@ -108,7 +170,43 @@ export class D1Store {
 
 // То же самое в памяти - для тестов
 export class MemoryStore {
-  constructor() { this.files = new Map(); this.m = new Map(); this.auth = new Map(); this.invites = new Map(); this.attempts = new Map(); this.sends = new Map(); }
+  constructor() { this.files = new Map(); this.m = new Map(); this.auth = new Map(); this.invites = new Map(); this.attempts = new Map(); this.sends = new Map(); this.audit = []; this.auditId = 0; this.auditCount = new Map(); this.denied = new Map(); this.retired = new Map(); }
+  async addAudit(r, { before, perDay, writeDay = perDay, write = false, keep, trimEvery = AUDIT_TRIM_EVERY }) {
+    const day = Math.floor(r.ts / DAY), limit = write ? writeDay : perDay;
+    const c = this.auditCount.get(r.uid) || { day, n_day: 0, w_day: 0, n_all: 0 };
+    if (c.day !== day) { c.n_day = 0; c.w_day = 0; c.day = day; }
+    const k = write ? 'w_day' : 'n_day';
+    if (c[k] < limit + 1) c.n_all++;
+    c[k]++;
+    this.auditCount.set(r.uid, c);
+    if (c[k] > limit + 1) return 'quota';
+    const row = c[k] > limit ? { ...r, route: write ? 'audit-quota-write' : 'audit-quota', target: null } : r;
+    this.audit.push({ id: ++this.auditId, ...row });
+    this.audit = this.audit.filter(a => a.ts >= before);
+    if (c.n_all % trimEvery === 0) {
+      const own = this.audit.filter(a => a.uid === r.uid);
+      if (own.length > keep) { const cut = own.at(-keep - 1).id; this.audit = this.audit.filter(a => a.uid !== r.uid || a.id > cut); }
+    }
+    return row === r ? 'row' : 'quota';
+  }
+  async listAuditCount({ sinceDay }) {
+    return [...this.auditCount].filter(([, c]) => c.day >= sinceDay).sort(([a], [b]) => a.localeCompare(b))
+      .map(([uid, c]) => ({ uid, day: c.day, n_day: c.n_day, w_day: c.w_day }));
+  }
+  async retireUid(uid, at) { if (!this.retired.has(uid)) this.retired.set(uid, at); }
+  async isRetired(uid) { return this.retired.has(uid); }
+  async countDenied({ day, route, status }, beforeDay) {
+    const k = JSON.stringify([day, route, status]);
+    this.denied.set(k, (this.denied.get(k) || 0) + 1);
+    for (const key of this.denied.keys()) if (JSON.parse(key)[0] < beforeDay) this.denied.delete(key);
+  }
+  async listDenied({ sinceDay }) {
+    return [...this.denied].map(([k, n]) => { const [day, route, status] = JSON.parse(k); return { day, route, status, n }; })
+      .filter(r => r.day >= sinceDay).sort((a, b) => a.day - b.day || a.route.localeCompare(b.route) || a.status - b.status);
+  }
+  async listAudit({ uid, after, since, limit }) {
+    return this.audit.filter(a => a.id > after && a.ts >= since && (uid == null || a.uid === uid)).slice(0, limit).map(a => ({ ...a }));
+  }
   async get(path) { const f = this.files.get(path); return f ? { ...f } : null; }
   async put(path, body, rev) {
     const f = this.files.get(path);

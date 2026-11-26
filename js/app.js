@@ -931,7 +931,8 @@ async function renderTeam() {
       avatar(m.name),
       h('div', { class: 'member-text' }, h('strong', null, m.name, uid === s.me.uid ? ' (вы)' : ''), h('span', { class: 'muted small' }, 'с ' + formatDate(m.addedAt))),
       h('div', { class: 'member-actions' },
-        s.isOwner && m.role !== 'owner'
+        V.isService(m) ? h('span', { class: 'tag', title: 'Программа: без личного сейфа, отправок и коллекций «для всех»' }, 'Сервис')
+        : s.isOwner && m.role !== 'owner'
           ? h('select', {
             'aria-label': 'Роль',
             onchange: e => run(async () => { await s.setRole(uid, e.target.value); toast('Роль изменена'); renderNav(); renderContent(); }, e.target),
@@ -958,7 +959,7 @@ async function renderTeam() {
   // Видны только коллекции, к которым есть ключ (у владельца и админов - все)
   body.append(h('div', { class: 'card' }, s.collections().filter(c => !c.personal).map(({ cid }) => {
     const col = s.org.collections[cid];
-    const who = col.all ? 'Вся команда' : ['Админы', ...col.members.map(u => s.org.members[u]?.name).filter(Boolean)].join(', ');
+    const who = col.all ? 'Вся команда' + (Object.values(s.org.members).some(V.isService) ? ', кроме сервисов' : '') :['Админы', ...col.members.map(u => s.org.members[u]?.name).filter(Boolean)].join(', ');
     return h('div', { class: 'member' },
       h('span', { class: 'avatar icon-avatar' }, icon(col.all ? 'users' : 'folder')),
       h('div', { class: 'member-text' }, h('strong', null, s.collectionName(cid)), h('span', { class: 'muted small' }, who)),
@@ -995,15 +996,20 @@ async function approveDialog(p) {
   const s = state.session;
   const restricted = Object.entries(s.org.collections).filter(([, c]) => !c.all);
   const checks = restricted.map(([cid]) => ({ cid, el: h('input', { type: 'checkbox' }), name: s.collectionName(cid) }));
+  // Участник-сервис (например, Директор): заявка от kb enroll помечена, решает всё равно админ
+  const service = h('input', { type: 'checkbox', checked: !!p.service });
   const ok = await modal('Заявка: ' + p.name, h('div', null,
     h('p', null, 'Попросите человека назвать код с его экрана. Принимайте, только если коды совпадают:'),
     h('p', { class: 'code big-code' }, p.code),
     h('p', { class: 'muted small' }, 'Если код другой, кто-то мог подменить заявку. Тогда отклоните её.'),
-    restricted.length ? h('div', null, h('p', null, 'Доступ к коллекциям (к «для всех» он будет и так):'),
+    h('label', { class: 'check' }, service, 'Участник-сервис (программа): без личного сейфа, отправок и коллекций «для всех», админом не станет'),
+    restricted.length < Object.keys(s.org.collections).length
+      ? h('p', { class: 'muted small' }, 'Сервис можно принять, только когда в команде нет коллекций «для всех»: иначе старые версии Ключницы сочтут файл команды подделанным. Сначала сделайте их «для выбранных».') : null,
+    restricted.length ? h('div', null, h('p', null, 'Доступ к коллекциям (к «для всех» обычный участник получит и так):'),
       checks.map(c => h('label', { class: 'check' }, c.el, c.name))) : null),
   [
     { label: 'Отмена', value: false },
-    { label: 'Коды совпадают, принять', kind: 'primary', onClick: () => s.approve(p.uid, p.code, checks.filter(c => c.el.checked).map(c => c.cid)).then(() => true) },
+    { label: 'Коды совпадают, принять', kind: 'primary', onClick: () => s.approve(p.uid, p.code, checks.filter(c => c.el.checked).map(c => c.cid), { service: service.checked }).then(() => true) },
   ]);
   if (ok) {
     toast(p.name + ' в команде');
@@ -1019,7 +1025,7 @@ async function collectionDialog(cid) {
   const name = h('input', { value: colName, maxlength: 60, required: true });
   const all = h('input', { type: 'checkbox', checked: col.all });
   const people = Object.entries(s.org.members).filter(([, m]) => m.role === 'member');
-  const checks = people.map(([uid, m]) => ({ uid, el: h('input', { type: 'checkbox', checked: col.members.includes(uid) }), name: m.name }));
+  const checks = people.map(([uid, m]) => ({ uid, el: h('input', { type: 'checkbox', checked: col.members.includes(uid) }), name: m.name + (V.isService(m) ? ' (сервис)' : '') }));
   const list = h('div', { class: 'checks' },
     h('p', { class: 'muted small' }, 'Владелец и админы видят все коллекции. Кому из участников дать доступ:'),
     checks.length ? checks.map(c => h('label', { class: 'check' }, c.el, c.name)) : h('p', { class: 'muted small' }, 'Обычных участников пока нет.'));
