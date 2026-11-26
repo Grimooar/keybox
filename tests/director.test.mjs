@@ -26,7 +26,7 @@ for (const k of ['log', 'warn', 'error', 'info', 'debug']) {
 }
 
 const db = new MemoryStore();
-const env = { SETUP_CODE: 'setup-code-dir', ALLOWED_ORIGINS: 'https://grimooar.github.io' };
+const env = { SETUP_CODE: 'setup-code-dir', ALLOWED_ORIGINS: 'https://grimooar.github.io', AUDIT_SALT: 'audit-salt-' + C.randomHex(8) };
 const fetchFn = (url, opts) => handle(new Request(url, opts), db, env);
 const BASE = 'https://api.test';
 const TEAM = C.b64e(C.randomBytes(24));
@@ -34,6 +34,15 @@ const api = () => new ApiStorage(BASE, TEAM, fetchFn);
 const dev = () => V.memorySeen();
 const SECRET = 'Dir-Secret-' + C.randomHex(12);
 const item = (name, password) => ({ id: C.randomHex(8), type: 'login', name, username: 'robot', password, uris: ['https://example.com'], notes: '' });
+// Файл команды, подписанный владельцем мимо проверок клиента (так пишет старый или чужой клиент)
+async function forgedOrg(s, mutate) {
+  await s.refresh();
+  const d = structuredClone(s.org);
+  await mutate(d);
+  d.version += 1; d.signer = s.me.uid; delete d.sig;
+  d.sig = await C.signObj(s.me.signSk, d);
+  return s.s.write(V.ORG, JSON.stringify(d), s.orgRev);
+}
 
 let owner, dir, general, dirCol, other;
 
@@ -50,8 +59,17 @@ await test('сервис: заявка помечена, админ приним
   await owner.refresh();
   const p = (await owner.pendingUsers()).find(x => x.uid === dir.me.uid);
   assert.equal(p.service, true);
+  // Пока есть коллекция «для всех», сервис не принять: старые клиенты сочли бы файл команды подделанным
+  await rejects(owner.approve(dir.me.uid, p.code, [], { service: true }), /не совмещаются/);
+  const raw = { name: 'Директор', role: 'member', boxPk: dir.me.boxPk, signPk: dir.me.signPk, addedAt: Date.now(), service: true };
+  await rejects(forgedOrg(owner, d => { d.members[dir.me.uid] = raw; }), /не совмещаются/);
+  await owner.refresh();
+  assert.ok(!owner.org.members[dir.me.uid]);
+  await owner.updateCollection(general, { all: false, members: [] });
   await owner.approve(dir.me.uid, p.code, [], { service: true });
   dirCol = await owner.createCollection('Директор', false, [dir.me.uid]);
+  // И наоборот: при сервисе в команде новую коллекцию «для всех» не создать
+  await rejects(owner.createCollection('Все', true), /не совмещаются/);
   await dir.refresh();
   assert.equal(dir.role, 'member');
   assert.equal(dir.isService, true);
@@ -105,20 +123,29 @@ await test('сервис не становится админом и не тер
 });
 
 await test('коллекция «для всех» не открывается сервису, даже если ключ подложить', async () => {
-  // Клиент владельца со старыми правилами выдал бы ключ всем - сервер такой файл не примет
-  const d = structuredClone(owner.org);
+  // Клиент со старыми правилами сделал бы коллекцию «для всех» с ключом каждому - сервер объясняет, почему нет
   const k = owner.keys.get(general);
-  d.collections[general].wraps[dir.me.uid] = await C.sealTo(dir.me.boxPk, k.key, `wrap:${d.orgId}:${general}:${k.ver}:${dir.me.uid}`);
-  d.version += 1; d.signer = owner.me.uid; delete d.sig;
-  d.sig = await C.signObj(owner.me.signSk, d);
-  await rejects(owner.s.write(V.ORG, JSON.stringify(d), owner.orgRev), /не прошёл проверку/);
-  // Сделать общую коллекцию «для выбранных» и добавить сервис - можно явно
-  await owner.updateCollection(general, { all: false, members: [dir.me.uid] });
+  await rejects(forgedOrg(owner, async d => {
+    d.collections[general].all = true;
+    d.collections[general].wraps[dir.me.uid] = await C.sealTo(dir.me.boxPk, k.key, `wrap:${d.orgId}:${general}:${k.ver}:${dir.me.uid}`);
+  }), /не совмещаются.*старые версии/);
+  // Ключ сервису от коллекции «для всех» - подделка и для нового клиента
+  const d = structuredClone(owner.org);
+  d.collections[general].all = true;
+  d.collections[general].wraps[dir.me.uid] = 'x';
+  await rejects(V.verifyOrg(d, owner.me.pin, null), /подделан/);
+  // Сделать коллекцию «для выбранных» и добавить сервис - можно явно
+  await owner.updateCollection(general, { members: [dir.me.uid] });
   await dir.refresh();
   assert.ok(dir.collections().some(c => c.cid === general));
-  await owner.updateCollection(general, { all: true });
+  await rejects(owner.updateCollection(general, { all: true }), /не совмещаются/);
+  await owner.updateCollection(general, { members: [] });
   await dir.refresh();
   assert.ok(!dir.collections().some(c => c.cid === general));
+});
+
+await test('файл команды новее клиента: «обновите», а не «подделан»', async () => {
+  await rejects(V.verifyOrg({ ...owner.org, v: 2 }, owner.me.pin, null), /Обновите/);
 });
 
 await test('удаление сервиса: доступ пропадает, ключ коллекции меняется', async () => {
@@ -149,11 +176,78 @@ await test('журнал: кто, что, когда - по каждому за�
   // Файл команды читается без подписи (по секрету команды) - uid в такой строке пустой
   assert.ok(rows.some(r => r.route === 'api/f/org.json' && r.uid === null && r.status === 200));
   assert.ok(rows.every(r => Number.isSafeInteger(r.ts) && r.ip && r.ip !== 'local'));
-  // Неверный вход и отклонённая подпись тоже в журнале
+  // Неверный вход тоже в журнале, но uid («кто») пустой: чей вход пробовали - только в target
   await V.unlock(api(), owner.me.uid, 'wrong-pass', dev()).catch(() => {});
   const bad = db.audit.at(-1);
-  assert.deepEqual([bad.route, bad.uid, bad.status], ['api/login', owner.me.uid, 401]);
+  assert.deepEqual([bad.route, bad.uid, bad.target, bad.status], ['api/login', null, owner.me.uid, 401]);
   db.attempts.clear();
+  // Верный пароль - uid заполнен
+  await V.unlock(api(), owner.me.uid, 'owner-pass', dev());
+  const good = db.audit.findLast(r => r.route === 'api/login');
+  assert.deepEqual([good.uid, good.target, good.status], [owner.me.uid, owner.me.uid, 200]);
+});
+
+const H = (extra = {}) => ({ 'X-KB-Team': TEAM, Origin: 'https://grimooar.github.io', ...extra });
+
+await test('журнал: заявка с чужим uid в пути не подставляет «кто»', async () => {
+  const fakeUid = C.randomHex(16);
+  const before = db.audit.length;
+  const r = await fetchFn(BASE + '/api/f/users/' + fakeUid + '.json', { method: 'PUT', headers: H({ 'X-KB-Invite': 'bad-token' }), body: '{}' });
+  assert.ok(r.status >= 400);
+  const row = db.audit.at(-1);
+  assert.equal(db.audit.length, before + 1);
+  assert.deepEqual([row.route, row.uid, row.target], ['api/f/users/*', null, fakeUid]);
+});
+
+await test('журнал: пустой uid у запросов без подписи и у отказов подписи', async () => {
+  const before = db.audit.length;
+  await fetchFn(BASE + '/api/people', { headers: H() });
+  await fetchFn(BASE + '/api/prelogin/' + owner.me.uid, { headers: H() });
+  await fetchFn(BASE + '/api/f/org.json', { headers: H() });
+  // Подпись от имени владельца, но неверная: uid в заголовке - не повод писать его как «кто»
+  await fetchFn(BASE + '/api/f/vault/' + general + '.json', { headers: H({ 'X-KB-Auth': `${owner.me.uid}:${Date.now()}:AAAA` }) });
+  const rows = db.audit.slice(before).map(r => [r.route, r.uid, r.target, r.status]);
+  assert.deepEqual(rows, [
+    ['api/people', null, null, 200],
+    ['api/prelogin/*', null, owner.me.uid, 200],
+    ['api/f/org.json', null, null, 200],
+    ['api/f/vault/*', null, general, 401],
+  ]);
+});
+
+await test('журнал: без секрета команды и на неизвестный путь - только счётчик, не строки', async () => {
+  const before = db.audit.length;
+  for (let i = 0; i < 50; i++) await fetchFn(BASE + '/api/anything' + i, {});
+  for (let i = 0; i < 20; i++) await fetchFn(BASE + '/api/anything' + i, { headers: H() });
+  for (let i = 0; i < 5; i++) await fetchFn(BASE + '/api/people', { headers: { 'X-KB-Team': 'wrong' } });
+  await fetchFn(BASE + '/api/sends/' + C.randomHex(16), {});
+  assert.equal(db.audit.length, before);
+  const { rows, denied } = (await owner.s.req('GET', 'api/audit?limit=1')).data;
+  assert.equal(rows.length, 1);
+  const n = (route, status) => denied.filter(x => x.route === route && x.status === status).reduce((a, x) => a + x.n, 0);
+  assert.equal(n('other', 403), 50);
+  assert.equal(denied.filter(x => x.route === 'other').reduce((a, x) => a + x.n, 0), 70); // с секретом команды, но без подписи - 401
+  assert.equal(n('api/people', 403), 5);
+  assert.equal(n('api/sends/*', 404), 1);
+  // Участнику счётчик не отдаётся
+  assert.equal((await dir.s.req('GET', 'api/audit?limit=1')).data.denied, undefined);
+});
+
+await test('журнал: потолок строк AUDIT_MAX_ROWS', async () => {
+  const saved = db.audit;
+  env.AUDIT_MAX_ROWS = '5';
+  try {
+    for (let i = 0; i < 12; i++) await fetchFn(BASE + '/api/people', { headers: H() });
+    assert.equal(db.audit.length, 5);
+    assert.ok(db.audit.every(r => r.route === 'api/people'));
+  } finally { delete env.AUDIT_MAX_ROWS; db.audit = [...saved, ...db.audit]; }
+});
+
+await test('журнал: без AUDIT_SALT адрес не пишется вовсе', async () => {
+  const salt = env.AUDIT_SALT;
+  delete env.AUDIT_SALT;
+  try { await fetchFn(BASE + '/api/people', { headers: { 'X-KB-Team': TEAM, 'CF-Connecting-IP': '203.0.113.9' } }); } finally { env.AUDIT_SALT = salt; }
+  assert.equal(db.audit.at(-1).ip, null);
 });
 
 await test('журнал: участник читает только свои строки, владелец - все', async () => {
@@ -176,9 +270,7 @@ await test('журнал: адрес хранится только как HMAC, 
   assert.notEqual(row.ip, (await fetchFn(BASE + '/api/people', { headers: { 'X-KB-Team': TEAM, 'CF-Connecting-IP': '203.0.113.8' } }), db.audit.at(-1).ip));
   // Срок хранения: строки старше AUDIT_DAYS уходят при попутной чистке
   db.audit.unshift({ id: 0, ts: Date.now() - 400 * 24 * 3600 * 1000, uid: null, method: 'GET', route: 'other', target: null, status: 404, ip: 'x' });
-  const rnd = Math.random;
-  Math.random = () => 0;
-  try { await fetchFn(BASE + '/api/people', { headers: { 'X-KB-Team': TEAM } }); } finally { Math.random = rnd; }
+  await fetchFn(BASE + '/api/people', { headers: { 'X-KB-Team': TEAM } });
   assert.ok(db.audit.every(a => a.id !== 0));
 });
 

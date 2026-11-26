@@ -90,11 +90,26 @@ export class D1Store {
   async delSend(id) { await this.d1.prepare('DELETE FROM sends WHERE id = ?').bind(id).run(); }
 
   // ---------- журнал запросов ----------
-  async addAudit(r, pruneBefore) {
-    const ins = this.d1.prepare('INSERT INTO audit (ts, uid, method, route, target, status, ip) VALUES (?, ?, ?, ?, ?, ?, ?)')
-      .bind(r.ts, r.uid, r.method, r.route, r.target, r.status, r.ip);
-    if (pruneBefore == null) await ins.run();
-    else await this.d1.batch([ins, this.d1.prepare('DELETE FROM audit WHERE ts < ?').bind(pruneBefore)]);
+  // Строка + чистка: старше срока (по индексу ts) и сверх потолка строк (по id) - отдельными запросами, чтобы шли по индексам
+  async addAudit(r, { before, keep }) {
+    await this.d1.batch([
+      this.d1.prepare('INSERT INTO audit (ts, uid, method, route, target, status, ip) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .bind(r.ts, r.uid, r.method, r.route, r.target, r.status, r.ip),
+      this.d1.prepare('DELETE FROM audit WHERE ts < ?').bind(before),
+      this.d1.prepare('DELETE FROM audit WHERE id <= (SELECT MAX(id) FROM audit) - ?').bind(keep),
+    ]);
+  }
+  // Запросы без строки журнала - счётчик на (день, класс пути, код): таблица растёт не быстрее числа дней
+  async countDenied({ day, route, status }, beforeDay) {
+    await this.d1.batch([
+      this.d1.prepare(`INSERT INTO audit_denied (day, route, status, n) VALUES (?, ?, ?, 1)
+        ON CONFLICT (day, route, status) DO UPDATE SET n = n + 1`).bind(day, route, status),
+      this.d1.prepare('DELETE FROM audit_denied WHERE day < ?').bind(beforeDay),
+    ]);
+  }
+  async listDenied({ sinceDay }) {
+    const { results } = await this.d1.prepare('SELECT day, route, status, n FROM audit_denied WHERE day >= ? ORDER BY day, route, status').bind(sinceDay).all();
+    return results;
   }
   async listAudit({ uid, after, since, limit }) {
     const { results } = await this.d1.prepare(`SELECT id, ts, uid, method, route, target, status, ip FROM audit
@@ -121,10 +136,20 @@ export class D1Store {
 
 // То же самое в памяти - для тестов
 export class MemoryStore {
-  constructor() { this.files = new Map(); this.m = new Map(); this.auth = new Map(); this.invites = new Map(); this.attempts = new Map(); this.sends = new Map(); this.audit = []; this.auditId = 0; }
-  async addAudit(r, pruneBefore) {
+  constructor() { this.files = new Map(); this.m = new Map(); this.auth = new Map(); this.invites = new Map(); this.attempts = new Map(); this.sends = new Map(); this.audit = []; this.auditId = 0; this.denied = new Map(); }
+  async addAudit(r, { before, keep }) {
     this.audit.push({ id: ++this.auditId, ...r });
-    if (pruneBefore != null) this.audit = this.audit.filter(a => a.ts >= pruneBefore);
+    const maxId = this.auditId;
+    this.audit = this.audit.filter(a => a.ts >= before && a.id > maxId - keep);
+  }
+  async countDenied({ day, route, status }, beforeDay) {
+    const k = JSON.stringify([day, route, status]);
+    this.denied.set(k, (this.denied.get(k) || 0) + 1);
+    for (const key of this.denied.keys()) if (JSON.parse(key)[0] < beforeDay) this.denied.delete(key);
+  }
+  async listDenied({ sinceDay }) {
+    return [...this.denied].map(([k, n]) => { const [day, route, status] = JSON.parse(k); return { day, route, status, n }; })
+      .filter(r => r.day >= sinceDay).sort((a, b) => a.day - b.day || a.route.localeCompare(b.route) || a.status - b.status);
   }
   async listAudit({ uid, after, since, limit }) {
     return this.audit.filter(a => a.id > after && a.ts >= since && (uid == null || a.uid === uid)).slice(0, limit).map(a => ({ ...a }));

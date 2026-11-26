@@ -76,6 +76,18 @@ function adminsOf(org) {
 // Без личного сейфа, отправок и коллекций «для всех» - только то, куда его добавили явно.
 export const isService = m => m?.role === 'member' && m.service === true;
 
+// Клиенты до Э2 (приложение до 2.3.0 и расширение) выдают ключ «для всех» каждому участнику и
+// сочтут файл команды подделанным, если у сервиса такого ключа нет. Поэтому сервис и коллекции
+// «для всех» в одной команде не живут: сначала коллекции «для всех» делаем «для выбранных».
+export function serviceConflict(org) {
+  const members = org?.members && typeof org.members === 'object' ? Object.values(org.members) : [];
+  if (!members.some(isService)) return null;
+  const all = Object.values(org.collections && typeof org.collections === 'object' ? org.collections : {}).filter(c => c?.all).length;
+  if (!all) return null;
+  return `Участник-сервис и коллекции «для всех» (сейчас их ${all}) не совмещаются: старые версии Ключницы и расширения ` +
+    'сочтут файл команды подделанным. Сделайте эти коллекции «для выбранных» и добавьте туда нужных участников, затем повторите.';
+}
+
 // Кто получает ключ коллекции: «для всех» - вся команда, кроме сервисов, иначе выбранные + владелец и админы
 export function accessOf(org, col) {
   const uids = Object.keys(org.members);
@@ -88,6 +100,8 @@ const fake = () => new VaultError('Файл команды повреждён и
 const isVer = n => Number.isSafeInteger(n) && n >= 1;
 
 export async function verifyOrg(org, pin, seen) {
+  // Новый формат файла - не подделка, а старая версия клиента
+  if (Number.isSafeInteger(org?.v) && org.v > 1) throw new VaultError('Файл команды новее этой версии Ключницы. Обновите приложение и расширение.');
   if (!org || org.v !== 1 || org.orgId !== pin.orgId) throw fake();
   // Версии - целые числа: иначе сравнение «не старше ли» тихо отключается (undefined < n === false)
   if (!isVer(org.version) || !isVer(org.adminCert?.certVersion)) throw fake();
@@ -577,6 +591,8 @@ export class Session {
 
       const d = structuredClone(this.org);
       const res = await mutate(d);
+      const conflict = serviceConflict(d);
+      if (conflict) throw new VaultError(conflict);
 
       // Новые доступы - выдаём ключ; у кого забрали - меняем ключ коллекции
       const rotated = [];

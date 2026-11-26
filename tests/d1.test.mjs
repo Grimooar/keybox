@@ -38,10 +38,11 @@ const db = new D1Store(fakeD1(sqlite));
 await test('журнал: запись, выборка по участнику, постранично, чистка старого', async () => {
   const u1 = 'a'.repeat(32), u2 = 'b'.repeat(32);
   const row = (ts, uid, status = 200) => ({ ts, uid, method: 'GET', route: 'api/f/vault/*', target: 'c'.repeat(24), status, ip: 'hash' });
-  await db.addAudit(row(1000, u1));
-  await db.addAudit(row(2000, u2, 403));
-  await db.addAudit(row(3000, null));
-  await db.addAudit(row(4000, u1));
+  const keepAll = { before: 0, keep: 1000 };
+  await db.addAudit(row(1000, u1), keepAll);
+  await db.addAudit(row(2000, u2, 403), keepAll);
+  await db.addAudit({ ...row(3000, null), ip: null }, keepAll); // без AUDIT_SALT адреса нет
+  await db.addAudit(row(4000, u1), keepAll);
   const all = await db.listAudit({ uid: null, after: 0, since: 0, limit: 100 });
   assert.equal(all.length, 4);
   assert.deepEqual(Object.keys(all[0]).sort(), ['id', 'ip', 'method', 'route', 'status', 'target', 'ts', 'uid']);
@@ -50,8 +51,22 @@ await test('журнал: запись, выборка по участнику, 
   const page = await db.listAudit({ uid: null, after: all[0].id, since: 0, limit: 2 });
   assert.deepEqual(page.map(r => r.ts), [2000, 3000]);
   assert.deepEqual((await db.listAudit({ uid: null, after: 0, since: 3000, limit: 9 })).map(r => r.ts), [3000, 4000]);
-  await db.addAudit(row(5000, u2), 2500);
+  await db.addAudit(row(5000, u2), { before: 2500, keep: 1000 });
   assert.deepEqual((await db.listAudit({ uid: null, after: 0, since: 0, limit: 100 })).map(r => r.ts), [3000, 4000, 5000]);
+  // Потолок строк: остаются последние keep
+  await db.addAudit(row(6000, u2), { before: 0, keep: 2 });
+  assert.deepEqual((await db.listAudit({ uid: null, after: 0, since: 0, limit: 100 })).map(r => r.ts), [5000, 6000]);
+});
+
+await test('счётчик отказов: одна строка на день, путь и код; старые дни удаляются', async () => {
+  for (let i = 0; i < 50; i++) await db.countDenied({ day: 10, route: 'other', status: 403 }, 0);
+  await db.countDenied({ day: 10, route: 'api/people', status: 403 }, 0);
+  await db.countDenied({ day: 11, route: 'other', status: 404 }, 0);
+  assert.deepEqual((await db.listDenied({ sinceDay: 0 })).map(r => ({ ...r })), [
+    { day: 10, route: 'api/people', status: 403, n: 1 }, { day: 10, route: 'other', status: 403, n: 50 }, { day: 11, route: 'other', status: 404, n: 1 }]);
+  assert.equal((await db.listDenied({ sinceDay: 11 })).length, 1);
+  await db.countDenied({ day: 12, route: 'other', status: 404 }, 11);
+  assert.deepEqual((await db.listDenied({ sinceDay: 0 })).map(r => r.day), [11, 12]);
 });
 
 await test('файлы, мета и отправки работают на той же схеме', async () => {

@@ -72,6 +72,8 @@ console.log('capture.js + build');
 {
   const { readFileSync } = await import('node:fs');
   const { execFileSync } = await import('node:child_process');
+  const { fileURLToPath } = await import('node:url');
+  const { APP_VERSION } = await import('../js/config.js');
   const ext = new URL('../extension/', import.meta.url);
   test('capture.js самодостаточен и без console', () => {
     const src = readFileSync(new URL('capture.js', ext), 'utf8');
@@ -80,7 +82,8 @@ console.log('capture.js + build');
     assert.ok(!/console\./.test(src));
     assert.ok(src.includes("'kb-capture'"));
   });
-  execFileSync(process.execPath, [new URL('build.mjs', ext).pathname], { stdio: 'ignore' });
+  // fileURLToPath, а не .pathname: на Windows pathname - /C:/... и сборка не запускается
+  execFileSync(process.execPath, [fileURLToPath(new URL('build.mjs', ext))], { stdio: 'ignore' });
   for (const b of ['chrome', 'firefox']) test(`manifest ${b}`, () => {
     const m = JSON.parse(readFileSync(new URL(`dist/${b}/manifest.json`, ext), 'utf8'));
     assert.ok(m.content_scripts[0].js.includes('capture.js'));
@@ -89,6 +92,10 @@ console.log('capture.js + build');
     if (b === 'firefox') assert.deepEqual(m.background.scripts, ['background.js']);
     else assert.equal(m.background.service_worker, 'background.js');
     readFileSync(new URL(`dist/${b}/capture.js`, ext));
+    // Новая версия (обновит установленное расширение) и правила участника-сервиса в сборке
+    assert.equal(m.version, APP_VERSION);
+    const vault = readFileSync(new URL(`dist/${b}/lib/js/vault.js`, ext), 'utf8');
+    assert.ok(vault.includes('export function serviceConflict') && vault.includes('export const isService'));
   });
 }
 

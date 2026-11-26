@@ -2,13 +2,16 @@
 // Общий код (шифрование, сервер, хранилище) берётся из ../js без копий в репозитории.
 import { cpSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, '..');
-const { API_URL, APP_VERSION } = await import(join(root, 'js/config.js'));
+// import() берёт URL: на Windows голый путь C:\... не грузится
+const { API_URL, APP_VERSION } = await import(pathToFileURL(join(root, 'js/config.js')).href);
 const argonSri = /integrity="([^"]+)"/.exec(readFileSync(join(root, 'index.html'), 'utf8'))[1];
 
+// vault.js несёт правила участника-сервиса (Э2): без них расширение сочтёт файл команды с сервисом подделанным.
+// Версия расширения = APP_VERSION: новая сборка обновляет установленное расширение.
 const SHARED = ['crypto.js', 'vault.js', 'storage.js', 'tools.js', 'config.js'];
 const OWN = ['popup.html', 'popup.css', 'popup.js', 'background.js', 'match.js', 'fill.js', 'capture.js'];
 

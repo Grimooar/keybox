@@ -10,7 +10,10 @@ CREATE TABLE IF NOT EXISTS sends (id TEXT PRIMARY KEY, body TEXT NOT NULL, creat
 CREATE INDEX IF NOT EXISTS sends_expires ON sends (expires_at);
 
 -- Журнал запросов: кто (uid), что (метод, класс пути, объект - cid или uid файла), когда, чем кончилось.
--- Без тел запросов, заголовков и параметров; адрес - только HMAC с секретом сервера.
-CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, uid TEXT, method TEXT NOT NULL, route TEXT NOT NULL, target TEXT, status INTEGER NOT NULL, ip TEXT NOT NULL);
+-- Без тел запросов, заголовков и параметров; адрес - только HMAC с секретом AUDIT_SALT (без него - пусто).
+-- Строки - только запросам с верным секретом команды на известный путь; потолок строк и срок - в handler.js.
+CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, uid TEXT, method TEXT NOT NULL, route TEXT NOT NULL, target TEXT, status INTEGER NOT NULL, ip TEXT);
 CREATE INDEX IF NOT EXISTS audit_ts ON audit (ts);
 CREATE INDEX IF NOT EXISTS audit_uid ON audit (uid, id);
+-- Остальные запросы (без секрета команды, неизвестный путь) - счётчик: день (с 1970), класс пути, код ответа
+CREATE TABLE IF NOT EXISTS audit_denied (day INTEGER NOT NULL, route TEXT NOT NULL, status INTEGER NOT NULL, n INTEGER NOT NULL, PRIMARY KEY (day, route, status));

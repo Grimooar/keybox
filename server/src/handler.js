@@ -8,7 +8,7 @@
 //   X-KB-Invite - токен приглашения (только для заявки на вступление)
 
 import * as C from '../../js/crypto.js';
-import { verifyOrg, accessOf, isUid, isService } from '../../js/vault.js';
+import { verifyOrg, accessOf, isUid, isService, serviceConflict } from '../../js/vault.js';
 
 const ORG = 'org.json';
 const MAX_BODY = 2 * 1024 * 1024;
@@ -31,8 +31,11 @@ const SEND_NEW_LIMITS = [
 ];
 const SEND_PATH = /^api\/sends\/([0-9a-f]{32})$/;
 // Журнал запросов: кто, что, когда. Только класс пути и объект - без тел, заголовков, параметров и id отправок
+// Строка - только запросу с верным секретом команды на известный путь; остальное - счётчик за день
+// (день, класс пути, код ответа), так перебор адресов и чужие запросы не раздувают таблицу.
 const AUDIT_DAYS = 180;
-const AUDIT_PRUNE = 0.01; // доля запросов, попутно удаляющих старые строки
+const AUDIT_MAX_ROWS = 200000; // потолок строк: старше - удаляются при каждой записи
+const DAY = 24 * 3600 * 1000;
 const AUDIT_PAGE = { def: 200, max: 1000 };
 const AUDIT_FIXED = new Set(['api/setup', 'api/people', 'api/login', 'api/f/org.json', 'api/invites', 'api/team-secret', 'api/sends', 'api/list/users', 'api/audit']);
 const AUDIT_ROUTES = [
@@ -95,7 +98,9 @@ export async function handle(request, db, env) {
   });
 
   if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
-  const who = { uid: null }; // кто делает запрос - заполняет route, для журнала
+  // Для журнала, заполняет route: row - запрос с верным секретом команды (иначе только счётчик),
+  // uid - кто (только проверенный: подпись или верный пароль), target - чей вход пробовали
+  const who = { uid: null, row: false, target: null };
   let response;
   if (!originOk && !['GET', 'HEAD'].includes(request.method)) {
     response = json(403, { error: 'Чужой источник запроса' });
@@ -112,12 +117,14 @@ export async function handle(request, db, env) {
       }
     }
   }
-  await audit(db, env, request, url, who.uid, response.status);
+  await audit(db, env, request, url, who, response.status);
   return response;
 }
 
+const envInt = (v, def) => (Number.isSafeInteger(Number(v)) && Number(v) > 0 ? Number(v) : def);
+
 // Строка журнала. Ошибка журнала (например, таблицы ещё нет после деплоя) запрос не ломает.
-async function audit(db, env, request, url, uid, status) {
+async function audit(db, env, request, url, who, status) {
   const path = url.pathname.replace(/^\/+/, '');
   if (path === 'api/status' || !db.addAudit) return;
   let routeName = AUDIT_FIXED.has(path) ? path : 'other';
@@ -126,13 +133,20 @@ async function audit(db, env, request, url, uid, status) {
     const m = path.match(re);
     if (m) { routeName = name; target = m[1] ?? null; break; }
   }
+  if (isUid(who.target)) target = who.target;
   try {
     const now = sendNow(env);
+    const before = now - envInt(env.AUDIT_DAYS, AUDIT_DAYS) * DAY;
+    if (!who.row || routeName === 'other') {
+      await db.countDenied({ day: Math.floor(now / DAY), route: routeName, status }, Math.floor(before / DAY));
+      return;
+    }
+    // Адрес - HMAC с AUDIT_SALT из секретов Workers (не из базы: по дампу базы IPv4 перебирается за минуты).
+    // Без AUDIT_SALT адрес не пишем вовсе.
     const ip = request.headers.get('CF-Connecting-IP') || 'local';
-    const ipHash = await hmacB64(env.AUDIT_SALT || await serverPepper(db, env), 'ip:' + ip, 12);
-    const days = Number(env.AUDIT_DAYS) > 0 ? Number(env.AUDIT_DAYS) : AUDIT_DAYS;
-    const pruneBefore = Math.random() < AUDIT_PRUNE ? now - days * 24 * 3600 * 1000 : null;
-    await db.addAudit({ ts: now, uid: isUid(uid) ? uid : null, method: request.method.slice(0, 8), route: routeName, target, status, ip: ipHash }, pruneBefore);
+    const ipHash = env.AUDIT_SALT ? await hmacB64(env.AUDIT_SALT, 'ip:' + ip, 12) : null;
+    await db.addAudit({ ts: now, uid: isUid(who.uid) ? who.uid : null, method: request.method.slice(0, 8), route: routeName, target, status, ip: ipHash },
+      { before, keep: envInt(env.AUDIT_MAX_ROWS, AUDIT_MAX_ROWS) });
   } catch { /* журнал - не повод отказать в запросе */ }
 }
 
@@ -168,14 +182,24 @@ async function route(request, url, db, env, who = {}) {
   if (path === 'api/status' && method === 'GET') {
     return { body: { team: !!(await db.meta('pin')) } };
   }
-  if (path === 'api/setup' && method === 'POST') return setup(db, env, body);
+  // До секрета команды строку журнала получают только удачные запросы: создание команды и открытие отправки
+  if (path === 'api/setup' && method === 'POST') {
+    const res = await setup(db, env, body);
+    who.row = true;
+    return res;
+  }
   const sendM = path.match(SEND_PATH);
-  if (sendM && method === 'GET') return openSend(db, env, sendM[1], request.headers.get('CF-Connecting-IP') || 'local');
+  if (sendM && method === 'GET') {
+    const res = await openSend(db, env, sendM[1], request.headers.get('CF-Connecting-IP') || 'local');
+    who.row = true;
+    return res;
+  }
 
   // Дальше - только с секретом команды
   const teamHash = await db.meta('team');
   if (!teamHash) fail(404, 'Команда ещё не создана');
   if (!safeEqual(await sha(request.headers.get('X-KB-Team') || ''), teamHash)) fail(403, 'Неверная ссылка команды');
+  who.row = true;
 
   const pin = JSON.parse(await db.meta('pin'));
   const ctx = { db, env, pin, orgId: pin.orgId, ip: request.headers.get('CF-Connecting-IP') || 'local' };
@@ -189,8 +213,10 @@ async function route(request, url, db, env, who = {}) {
   if (path === 'api/f/org.json' && method === 'GET') return { body: { text: orgRow.body }, rev: orgRow.rev };
   const join = path.match(/^api\/f\/users\/([0-9a-f]{32})\.json$/);
   if (join && method === 'PUT' && request.headers.get('X-KB-Invite')) {
+    // uid заявки при отказе - только в target (из пути); «кто» - лишь когда сервер заявку принял
+    const res = await joinRequest(ctx, join[1], body, request.headers.get('X-KB-Invite'));
     who.uid = join[1];
-    return joinRequest(ctx, join[1], body, request.headers.get('X-KB-Invite'));
+    return res;
   }
 
   // Дальше - только подписанные запросы участников или заявок
@@ -281,7 +307,8 @@ async function fakeKdf(ctx, uid) {
 async function login(ctx, body, who) {
   const { uid, authKey } = parseJson(body);
   if (!isUid(uid) || typeof authKey !== 'string' || authKey.length > 100) fail(400, 'Неверный запрос');
-  who.uid = uid;
+  // Чей вход пробуют - в target; uid («кто») - только после верного пароля, иначе любой впишет в журнал чужое имя
+  who.target = uid;
   const auth = await ctx.db.getAuth(uid);
   const row = await ctx.db.get('users/' + uid);
   // Попытка засчитывается ДО проверки пароля и атомарно - параллельный перебор не обходит лимит
@@ -303,6 +330,7 @@ async function login(ctx, body, who) {
   await ctx.db.attempt(`ok:${uid}:${ctx.ip}`, now, 0);
   await ctx.db.clearAttempts(LIMITS[0].key(uid, ctx.ip));
   await ctx.db.forgive(LIMITS[1].key(uid));
+  who.uid = uid;
   return { body: { text: row.body }, rev: row.rev };
 }
 
@@ -413,6 +441,9 @@ async function writeOrg(ctx, body, rev) {
   requireAdmin(ctx);
   if (rev == null || rev !== ctx.orgRev) fail(409, 'Файл изменился, обновите данные');
   const next = parseJson(body);
+  // До проверки подписи: понятная ошибка вместо «подделан», если старый клиент выдал сервису ключ «для всех»
+  const conflict = serviceConflict(next);
+  if (conflict) fail(400, conflict);
   const seen = { get: () => ({ version: ctx.org.version + 1, certVersion: ctx.org.adminCert.certVersion }) };
   await verifyOrg(next, ctx.pin, seen).catch(e => fail(400, 'Файл команды не прошёл проверку: ' + e.message));
   if (next.signer !== ctx.me.uid) fail(400, 'Подписано не вами');
@@ -494,7 +525,9 @@ async function readAudit(ctx, url) {
   if (![after, since, limit].every(Number.isSafeInteger) || after < 0 || since < 0 || limit < 1) fail(400, 'Неверные параметры');
   const uid = ['owner', 'admin'].includes(ctx.me.role) ? null : ctx.me.uid;
   const rows = await ctx.db.listAudit({ uid, after, since, limit: Math.min(limit, AUDIT_PAGE.max) });
-  return { body: { rows } };
+  // Счётчик запросов без строки журнала (без секрета команды, на неизвестный путь) - только владельцу и админам
+  if (uid !== null) return { body: { rows } };
+  return { body: { rows, denied: await ctx.db.listDenied({ sinceDay: Math.floor(since / DAY) }) } };
 }
 
 // ---------- одноразовая отправка секрета ----------

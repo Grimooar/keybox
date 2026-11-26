@@ -284,7 +284,8 @@ function pendingBanner() {
   const user = h('input', { type: 'text', 'aria-label': 'Логин', autocomplete: 'off', value: p.username || '' });
   const cols = s.collections();
   const sel = h('select', { 'aria-label': 'Коллекция' }, cols.map(c => h('option', { value: c.cid }, c.name || 'Без названия')));
-  sel.value = s.personalCid;
+  // У участника-сервиса личного сейфа нет - тогда первая доступная коллекция
+  sel.value = cols.some(c => c.cid === s.personalCid) ? s.personalCid : cols[0]?.cid || '';
   const btn = h('button', { class: 'btn primary sm', type: 'submit' }, 'Сохранить');
   box.append(h('strong', null, 'Сохранить пароль для ' + host + '?'),
     p.isNew ? h('p', { class: 'muted small' }, 'Это похоже на новый пароль.') : null,

@@ -1003,6 +1003,8 @@ async function approveDialog(p) {
     h('p', { class: 'code big-code' }, p.code),
     h('p', { class: 'muted small' }, 'Если код другой, кто-то мог подменить заявку. Тогда отклоните её.'),
     h('label', { class: 'check' }, service, 'Участник-сервис (программа): без личного сейфа, отправок и коллекций «для всех», админом не станет'),
+    restricted.length < Object.keys(s.org.collections).length
+      ? h('p', { class: 'muted small' }, 'Сервис можно принять, только когда в команде нет коллекций «для всех»: иначе старые версии Ключницы сочтут файл команды подделанным. Сначала сделайте их «для выбранных».') : null,
     restricted.length ? h('div', null, h('p', null, 'Доступ к коллекциям (к «для всех» обычный участник получит и так):'),
       checks.map(c => h('label', { class: 'check' }, c.el, c.name))) : null),
   [
