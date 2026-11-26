@@ -4,7 +4,7 @@ import { createRequire } from 'node:module';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
-import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -59,7 +59,7 @@ async function kb(argv, extraEnv = {}) {
   const out = [], err = [];
   const code = await main(argv, {
     env: { ...creds, KB_STATE_DIR: join(tmp, 'state'), ...extraEnv },
-    fetch: fetchFn, out: l => out.push(l), err: l => err.push(l), spawn: spawnChild,
+    fetch: fetchFn, out: l => out.push(l), err: l => err.push(l), spawn: spawnChild, protectFile: () => true,
   });
   outputs.push(...out, ...err);
   return { code, out: out.join('\n'), err: err.join('\n') };
@@ -237,20 +237,28 @@ await test('scan: симлинк на родительскую папку не �
   assert.match(r.out, /scan: чисто/);
 });
 
-await test('enroll на Windows: права через icacls или явное предупреждение', async () => {
+await test('enroll на Windows: файл закрыт icacls до записи ключей, иначе отказ без заявки', async () => {
   const code = (await V.teamCode(owner.org)).replace(/\D/g, '');
-  const run = async (n, io) => {
+  const run = async (n, io, want = 0) => {
     const err = [];
     const token = (await owner.s.createInvite()).token;
     const r = await main(['enroll', '--link', `https://app/#t=${TEAM}&c=${code}&i=${token}`, '--name', 'Сервис ' + n, '--out', join(tmp, 'win' + n + '.json')],
       { env: { KB_API: BASE, KB_STATE_DIR: join(tmp, 'state-w' + n) }, fetch: fetchFn, out: () => {}, err: l => err.push(l), spawn: spawnChild, ...io });
-    assert.equal(r, 0, err.join('\n'));
+    assert.equal(r, want, err.join('\n'));
     return err.join('\n');
   };
-  const protectedPaths = [];
-  assert.match(await run(1, { platform: 'win32', protectFile: p => (protectedPaths.push(p), true) }), /только текущий пользователь/);
-  assert.deepEqual(protectedPaths, [join(tmp, 'win1.json')]);
-  assert.match(await run(2, { platform: 'win32', protectFile: () => { throw new Error('icacls'); } }), /Внимание: не удалось ограничить права/);
+  // Права ставятся на ещё пустой файл: ключей в нём до icacls нет
+  const seen = [];
+  assert.match(await run(1, { platform: 'win32', protectFile: p => (seen.push([p, readFileSync(p, 'utf8')]), true) }), /только текущий пользователь/);
+  assert.deepEqual(seen, [[join(tmp, 'win1.json'), '']]);
+  assert.ok(JSON.parse(readFileSync(join(tmp, 'win1.json'), 'utf8')).KB_SIGN_SK);
+  // icacls не сработал - файла нет, заявка не ушла
+  await owner.refresh();
+  const pending = (await owner.pendingUsers()).length;
+  assert.match(await run(2, { platform: 'win32', protectFile: () => { throw new Error('icacls'); } }, 1), /Не удалось ограничить права.*заявка не отправлена/);
+  assert.equal(existsSync(join(tmp, 'win2.json')), false);
+  await owner.refresh();
+  assert.equal((await owner.pendingUsers()).length, pending);
   assert.equal(await run(3, { platform: 'linux' }), '');
 });
 

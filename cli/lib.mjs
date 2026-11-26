@@ -13,7 +13,7 @@
 // Пароль или код 2FA получает только дочерний процесс (kb run / kb totp) через переменную окружения.
 
 import { createRequire } from 'node:module';
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, win32 } from 'node:path';
 
@@ -230,6 +230,26 @@ async function cmdEnroll(io, opts) {
   if (!r) throw new V.VaultError('Команда не найдена');
   const teamCode = await V.teamCode(r.org);
   if (teamCode.replace(/\D/g, '') !== code) throw new V.VaultError('Код команды не совпадает со ссылкой: сервер подменил команду или ссылка чужая');
+  // Файл для ключей - пустым и сразу с ограниченными правами, до заявки: ключи попадают только в уже закрытый файл.
+  // На Windows mode 0o600 не действует - права через icacls (только текущий пользователь); не вышло - заявку не шлём.
+  writeFileSync(opts.out, '', { mode: 0o600, flag: 'wx' });
+  let written = false;
+  try {
+    if ((io.platform || process.platform) === 'win32') {
+      const ok = await (async () => io.protectFile?.(opts.out))().catch(() => false);
+      if (!ok) throw new V.VaultError('Не удалось ограничить права на ' + opts.out + ' (icacls): ключи не записаны, заявка не отправлена. Укажите --out в своей папке на диске NTFS.');
+      io.err('Права на ' + opts.out + ': только текущий пользователь (icacls).');
+    }
+    await enrollInto(io, opts, { storage, teamCode, api, team });
+    written = true;
+  } finally {
+    if (!written) try { unlinkSync(opts.out); } catch { /* уже нет */ }
+  }
+  return 0;
+}
+
+// Заявка и ключи в уже созданный закрытый файл opts.out
+async function enrollInto(io, opts, { storage, teamCode, api, team }) {
   // Мастер-пароль нужен только для восстановления: случайный, уходит в файл вместе с ключами
   const master = io.env.KB_MASTER || C.b64e(C.randomBytes(24));
   const s = await V.joinTeam(storage, { userName: String(opts.name), password: master, seen: fileSeen(io.stateDir), expectedTeamCode: teamCode, kind: 'service' });
@@ -237,20 +257,13 @@ async function cmdEnroll(io, opts) {
     KB_API: api, KB_UID: s.me.uid, KB_SIGN_SK: s.me.secret.signSk, KB_BOX_SK: s.me.secret.boxSk,
     KB_TEAM_SECRET: team, KB_PIN: pinText(s.me.pin), KB_MASTER: master,
   };
-  writeFileSync(opts.out, JSON.stringify(creds, null, 1) + '\n', { mode: 0o600, flag: 'wx' });
-  // На Windows mode 0o600 не действует: права - через icacls (только текущий пользователь), иначе - предупреждение
-  if ((io.platform || process.platform) === 'win32') {
-    const ok = await (async () => io.protectFile?.(opts.out))().catch(() => false);
-    io.err(ok
-      ? 'Права на ' + opts.out + ': только текущий пользователь (icacls).'
-      : 'Внимание: не удалось ограничить права на ' + opts.out + ' (icacls). Файл с ключами читают все, у кого есть доступ к папке: перенесите ключи и удалите файл сразу.');
-  }
+  // В тот же (уже закрытый) файл: r+ не создаёт новый и не меняет права
+  writeFileSync(opts.out, JSON.stringify(creds, null, 1) + '\n', { flag: 'r+' });
   io.out('Заявка отправлена.');
   io.out('uid: ' + s.me.uid);
   io.out('Код участника (сверить с окном заявки у владельца): ' + await s.myCode());
   io.out('Ключи записаны в ' + opts.out + ' - перенесите их в хранилище ключей и удалите файл.');
   io.out('Владелец: коллекции «для всех» сделать «для выбранных», принять заявку с галочкой «Участник-сервис» и добавить в коллекцию.');
-  return 0;
 }
 
 async function cmdList(io, opts) {
