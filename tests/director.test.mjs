@@ -136,6 +136,72 @@ await test('удаление сервиса: доступ пропадает, к
   assert.deepEqual(dir.collections().map(c => c.cid), [dirCol]);
 });
 
+await test('журнал: кто, что, когда - по каждому запросу, с отказами', async () => {
+  const before = db.audit.length;
+  await dir.refresh();
+  await dir.loadAll();
+  await dir.s.read('vault/' + other + '.json').catch(() => {});
+  const rows = db.audit.slice(before);
+  const vaultRead = rows.find(r => r.route === 'api/f/vault/*' && r.target === dirCol && r.uid === dir.me.uid);
+  assert.ok(vaultRead && vaultRead.method === 'GET' && vaultRead.status === 200);
+  const denied = rows.find(r => r.target === other);
+  assert.equal(denied.status, 403);
+  // Файл команды читается без подписи (по секрету команды) - uid в такой строке пустой
+  assert.ok(rows.some(r => r.route === 'api/f/org.json' && r.uid === null && r.status === 200));
+  assert.ok(rows.every(r => Number.isSafeInteger(r.ts) && r.ip && r.ip !== 'local'));
+  // Неверный вход и отклонённая подпись тоже в журнале
+  await V.unlock(api(), owner.me.uid, 'wrong-pass', dev()).catch(() => {});
+  const bad = db.audit.at(-1);
+  assert.deepEqual([bad.route, bad.uid, bad.status], ['api/login', owner.me.uid, 401]);
+  db.attempts.clear();
+});
+
+await test('журнал: участник читает только свои строки, владелец - все', async () => {
+  const mine = await dir.s.audit({ limit: 1000 });
+  assert.ok(mine.length > 0 && mine.every(r => r.uid === dir.me.uid));
+  const all = await owner.s.audit({ limit: 1000 });
+  assert.ok(all.some(r => r.uid === owner.me.uid) && all.some(r => r.uid === dir.me.uid));
+  // Постранично по id
+  const page = await owner.s.audit({ after: all[0].id, limit: 2 });
+  assert.deepEqual(page.map(r => r.id), [all[1].id, all[2].id]);
+  const r = await dir.s.req('GET', 'api/audit?limit=abc');
+  assert.equal(r.r.status, 400);
+});
+
+await test('журнал: адрес хранится только как HMAC, старые строки удаляются', async () => {
+  await fetchFn(BASE + '/api/people', { headers: { 'X-KB-Team': TEAM, 'CF-Connecting-IP': '203.0.113.7' } });
+  const row = db.audit.at(-1);
+  assert.equal(row.route, 'api/people');
+  assert.ok(!JSON.stringify(row).includes('203.0.113.7'));
+  assert.notEqual(row.ip, (await fetchFn(BASE + '/api/people', { headers: { 'X-KB-Team': TEAM, 'CF-Connecting-IP': '203.0.113.8' } }), db.audit.at(-1).ip));
+  // Срок хранения: строки старше AUDIT_DAYS уходят при попутной чистке
+  db.audit.unshift({ id: 0, ts: Date.now() - 400 * 24 * 3600 * 1000, uid: null, method: 'GET', route: 'other', target: null, status: 404, ip: 'x' });
+  const rnd = Math.random;
+  Math.random = () => 0;
+  try { await fetchFn(BASE + '/api/people', { headers: { 'X-KB-Team': TEAM } }); } finally { Math.random = rnd; }
+  assert.ok(db.audit.every(a => a.id !== 0));
+});
+
+await test('журнал: сломанный журнал не ломает запросы', async () => {
+  const add = db.addAudit;
+  db.addAudit = async () => { throw new Error('no such table: audit'); };
+  try { await dir.refresh(); } finally { db.addAudit = add; }
+});
+
+await test('в журнале нет секретов: ни паролей, ни шифртекста, ни подписей, ни секрета команды', async () => {
+  await dir.saveItem(dirCol, item('Ещё сервис', SECRET + '-2'));
+  const sid = C.randomHex(16);
+  await owner.s.req('POST', 'api/sends', JSON.stringify({ id: sid, body: 'cipher-' + C.randomHex(8) }));
+  await fetchFn(BASE + '/api/sends/' + sid, {});
+  const dump = JSON.stringify(db.audit);
+  const vaultBody = db.files.get('vault/' + dirCol).body;
+  const ct = JSON.parse(vaultBody).data.ct;
+  for (const bad of [SECRET, 'general-pw-1', 'bank-pw-1', TEAM, ct, sid, 'owner-pass']) assert.ok(!dump.includes(bad), 'в журнале: ' + bad.slice(0, 12));
+  assert.ok(!/sig|authKey|X-KB/i.test(dump));
+  const keys = new Set(db.audit.flatMap(Object.keys));
+  assert.deepEqual([...keys].sort(), ['id', 'ip', 'method', 'route', 'status', 'target', 'ts', 'uid']);
+});
+
 await test('секрет записи не попадает в консоль сервера', async () => {
   assert.ok(consoleLog.every(l => !l.includes(SECRET) && !l.includes('general-pw-1') && !l.includes(TEAM)));
 });

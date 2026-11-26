@@ -30,6 +30,17 @@ const SEND_NEW_LIMITS = [
   { key: () => 'sendnew:*', max: 300, window: 60 * 60 * 1000 },      // на всю команду в час
 ];
 const SEND_PATH = /^api\/sends\/([0-9a-f]{32})$/;
+// Журнал запросов: кто, что, когда. Только класс пути и объект - без тел, заголовков, параметров и id отправок
+const AUDIT_DAYS = 180;
+const AUDIT_PRUNE = 0.01; // доля запросов, попутно удаляющих старые строки
+const AUDIT_PAGE = { def: 200, max: 1000 };
+const AUDIT_FIXED = new Set(['api/setup', 'api/people', 'api/login', 'api/f/org.json', 'api/invites', 'api/team-secret', 'api/sends', 'api/list/users', 'api/audit']);
+const AUDIT_ROUTES = [
+  [/^api\/f\/vault\/((?:p-[0-9a-f]{32})|[0-9a-f]{24})\.json$/, 'api/f/vault/*'],
+  [/^api\/f\/users\/([0-9a-f]{32})\.json$/, 'api/f/users/*'],
+  [/^api\/prelogin\/([0-9a-f]{32})$/, 'api/prelogin/*'],
+  [/^api\/sends\/[0-9a-f]{32}$/, 'api/sends/*'],
+];
 // Подбор пароля: с одного адреса - 8 попыток за 15 минут; на участника всего - 50 в час.
 // Лимит по адресу не даёт постороннему запереть владельца, общий - ограничивает перебор с многих адресов.
 const LIMITS = [
@@ -84,15 +95,61 @@ export async function handle(request, db, env) {
   });
 
   if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
-  if (!originOk && !['GET', 'HEAD'].includes(request.method)) return json(403, { error: 'Чужой источник запроса' });
-  try {
-    const res = await route(request, url, db, env);
-    return json(res.status || 200, res.body ?? {}, res.rev != null ? { 'X-KB-Rev': String(res.rev) } : {});
-  } catch (e) {
-    if (e instanceof HttpError) return json(e.status, { ...e.extra, error: e.message });
-    console.error(e);
-    return json(500, { error: 'Ошибка сервера' });
+  const who = { uid: null }; // кто делает запрос - заполняет route, для журнала
+  let response;
+  if (!originOk && !['GET', 'HEAD'].includes(request.method)) {
+    response = json(403, { error: 'Чужой источник запроса' });
+  } else {
+    try {
+      const res = await route(request, url, db, env, who);
+      response = json(res.status || 200, res.body ?? {}, res.rev != null ? { 'X-KB-Rev': String(res.rev) } : {});
+    } catch (e) {
+      if (e instanceof HttpError) response = json(e.status, { ...e.extra, error: e.message });
+      else {
+        // Только имя и место ошибки: в тексте исключения может оказаться кусок запроса
+        console.error('Ошибка сервера:', e?.name, String(e?.stack || '').split('\n').slice(1, 4).join(' | '));
+        response = json(500, { error: 'Ошибка сервера' });
+      }
+    }
   }
+  await audit(db, env, request, url, who.uid, response.status);
+  return response;
+}
+
+// Строка журнала. Ошибка журнала (например, таблицы ещё нет после деплоя) запрос не ломает.
+async function audit(db, env, request, url, uid, status) {
+  const path = url.pathname.replace(/^\/+/, '');
+  if (path === 'api/status' || !db.addAudit) return;
+  let routeName = AUDIT_FIXED.has(path) ? path : 'other';
+  let target = null;
+  for (const [re, name] of AUDIT_ROUTES) {
+    const m = path.match(re);
+    if (m) { routeName = name; target = m[1] ?? null; break; }
+  }
+  try {
+    const now = sendNow(env);
+    const ip = request.headers.get('CF-Connecting-IP') || 'local';
+    const ipHash = await hmacB64(env.AUDIT_SALT || await serverPepper(db, env), 'ip:' + ip, 12);
+    const days = Number(env.AUDIT_DAYS) > 0 ? Number(env.AUDIT_DAYS) : AUDIT_DAYS;
+    const pruneBefore = Math.random() < AUDIT_PRUNE ? now - days * 24 * 3600 * 1000 : null;
+    await db.addAudit({ ts: now, uid: isUid(uid) ? uid : null, method: request.method.slice(0, 8), route: routeName, target, status, ip: ipHash }, pruneBefore);
+  } catch { /* журнал - не повод отказать в запросе */ }
+}
+
+async function hmacB64(secret, text, bytes = 32) {
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const mac = new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(text)));
+  return C.b64e(mac.slice(0, bytes));
+}
+
+// Секрет сервера: создаётся при первом обращении и не покидает базу
+async function serverPepper(db, env) {
+  let secret = env.FAKE_SALT_SECRET || await db.meta('pepper');
+  if (!secret) {
+    await db.metaInit('pepper', C.b64e(C.randomBytes(32)));
+    secret = await db.meta('pepper');
+  }
+  return secret;
 }
 
 async function readBody(request) {
@@ -103,7 +160,7 @@ async function readBody(request) {
   return body;
 }
 
-async function route(request, url, db, env) {
+async function route(request, url, db, env, who = {}) {
   const path = url.pathname.replace(/^\/+/, '');
   const method = request.method;
   const body = await readBody(request);
@@ -128,20 +185,23 @@ async function route(request, url, db, env) {
 
   if (path === 'api/people' && method === 'GET') return people(ctx);
   if (path.startsWith('api/prelogin/') && method === 'GET') return prelogin(ctx, path.slice(13));
-  if (path === 'api/login' && method === 'POST') return login(ctx, body);
+  if (path === 'api/login' && method === 'POST') return login(ctx, body, who);
   if (path === 'api/f/org.json' && method === 'GET') return { body: { text: orgRow.body }, rev: orgRow.rev };
   const join = path.match(/^api\/f\/users\/([0-9a-f]{32})\.json$/);
   if (join && method === 'PUT' && request.headers.get('X-KB-Invite')) {
+    who.uid = join[1];
     return joinRequest(ctx, join[1], body, request.headers.get('X-KB-Invite'));
   }
 
   // Дальше - только подписанные запросы участников или заявок
   ctx.me = await identify(ctx, request, method, url.pathname + url.search, body);
+  who.uid = ctx.me.uid;
 
   if (path === 'api/invites' && method === 'POST') return createInvite(ctx);
   if (path === 'api/team-secret' && method === 'POST') return rotateTeamSecret(ctx, body);
   if (path === 'api/sends' && method === 'POST') return createSend(ctx, body);
   if (sendM && method === 'DELETE') return deleteSend(ctx, sendM[1]);
+  if (path === 'api/audit' && method === 'GET') return readAudit(ctx, url);
   if (path === 'api/list/users' && method === 'GET') {
     requireAdmin(ctx);
     return { body: { names: (await db.list('users/')).map(p => p.slice(6)) } };
@@ -215,19 +275,13 @@ async function prelogin(ctx, uid) {
 }
 
 async function fakeKdf(ctx, uid) {
-  let secret = ctx.env.FAKE_SALT_SECRET || await ctx.db.meta('pepper');
-  if (!secret) {
-    await ctx.db.metaInit('pepper', C.b64e(C.randomBytes(32)));
-    secret = await ctx.db.meta('pepper');
-  }
-  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  const mac = new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode('salt:' + uid)));
-  return { ...C.KDF_DEFAULT, salt: C.b64e(mac.slice(0, 16)) };
+  return { ...C.KDF_DEFAULT, salt: await hmacB64(await serverPepper(ctx.db, ctx.env), 'salt:' + uid, 16) };
 }
 
-async function login(ctx, body) {
+async function login(ctx, body, who) {
   const { uid, authKey } = parseJson(body);
   if (!isUid(uid) || typeof authKey !== 'string' || authKey.length > 100) fail(400, 'Неверный запрос');
+  who.uid = uid;
   const auth = await ctx.db.getAuth(uid);
   const row = await ctx.db.get('users/' + uid);
   // Попытка засчитывается ДО проверки пароля и атомарно - параллельный перебор не обходит лимит
@@ -428,6 +482,19 @@ async function deleteFile(ctx, file, uid, cid) {
   }
   await ctx.db.del('vault/' + cid);
   return { body: { ok: true } };
+}
+
+// ---------- журнал ----------
+
+// Владелец и админы видят весь журнал, участник - только свои запросы (сервис сверяет свой журнал)
+async function readAudit(ctx, url) {
+  if (ctx.me.role === 'pending') fail(403, 'Только для участников команды');
+  const num = (k, def) => (url.searchParams.has(k) ? Number(url.searchParams.get(k)) : def);
+  const after = num('after', 0), since = num('since', 0), limit = num('limit', AUDIT_PAGE.def);
+  if (![after, since, limit].every(Number.isSafeInteger) || after < 0 || since < 0 || limit < 1) fail(400, 'Неверные параметры');
+  const uid = ['owner', 'admin'].includes(ctx.me.role) ? null : ctx.me.uid;
+  const rows = await ctx.db.listAudit({ uid, after, since, limit: Math.min(limit, AUDIT_PAGE.max) });
+  return { body: { rows } };
 }
 
 // ---------- одноразовая отправка секрета ----------

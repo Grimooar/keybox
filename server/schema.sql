@@ -8,3 +8,9 @@ CREATE TABLE IF NOT EXISTS attempts (key TEXT PRIMARY KEY, fails INTEGER NOT NUL
 -- Одноразовая отправка секрета: только шифртекст, ключ - во фрагменте ссылки у получателя
 CREATE TABLE IF NOT EXISTS sends (id TEXT PRIMARY KEY, body TEXT NOT NULL, created_by TEXT NOT NULL, expires_at INTEGER NOT NULL, views_left INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS sends_expires ON sends (expires_at);
+
+-- Журнал запросов: кто (uid), что (метод, класс пути, объект - cid или uid файла), когда, чем кончилось.
+-- Без тел запросов, заголовков и параметров; адрес - только HMAC с секретом сервера.
+CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, uid TEXT, method TEXT NOT NULL, route TEXT NOT NULL, target TEXT, status INTEGER NOT NULL, ip TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS audit_ts ON audit (ts);
+CREATE INDEX IF NOT EXISTS audit_uid ON audit (uid, id);

@@ -89,6 +89,19 @@ export class D1Store {
   async getSend(id) { return this.d1.prepare('SELECT id, created_by, expires_at, views_left FROM sends WHERE id = ?').bind(id).first(); }
   async delSend(id) { await this.d1.prepare('DELETE FROM sends WHERE id = ?').bind(id).run(); }
 
+  // ---------- журнал запросов ----------
+  async addAudit(r, pruneBefore) {
+    const ins = this.d1.prepare('INSERT INTO audit (ts, uid, method, route, target, status, ip) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .bind(r.ts, r.uid, r.method, r.route, r.target, r.status, r.ip);
+    if (pruneBefore == null) await ins.run();
+    else await this.d1.batch([ins, this.d1.prepare('DELETE FROM audit WHERE ts < ?').bind(pruneBefore)]);
+  }
+  async listAudit({ uid, after, since, limit }) {
+    const { results } = await this.d1.prepare(`SELECT id, ts, uid, method, route, target, status, ip FROM audit
+      WHERE id > ?1 AND ts >= ?2 AND (?3 IS NULL OR uid = ?3) ORDER BY id LIMIT ?4`).bind(after, since, uid, limit).all();
+    return results;
+  }
+
   // Создание команды - всё или ничего (D1 batch выполняется одной транзакцией)
   async setupAll({ pin, teamHash, uid, userBody, authHash, orgBody }) {
     try {
@@ -108,7 +121,14 @@ export class D1Store {
 
 // То же самое в памяти - для тестов
 export class MemoryStore {
-  constructor() { this.files = new Map(); this.m = new Map(); this.auth = new Map(); this.invites = new Map(); this.attempts = new Map(); this.sends = new Map(); }
+  constructor() { this.files = new Map(); this.m = new Map(); this.auth = new Map(); this.invites = new Map(); this.attempts = new Map(); this.sends = new Map(); this.audit = []; this.auditId = 0; }
+  async addAudit(r, pruneBefore) {
+    this.audit.push({ id: ++this.auditId, ...r });
+    if (pruneBefore != null) this.audit = this.audit.filter(a => a.ts >= pruneBefore);
+  }
+  async listAudit({ uid, after, since, limit }) {
+    return this.audit.filter(a => a.id > after && a.ts >= since && (uid == null || a.uid === uid)).slice(0, limit).map(a => ({ ...a }));
+  }
   async get(path) { const f = this.files.get(path); return f ? { ...f } : null; }
   async put(path, body, rev) {
     const f = this.files.get(path);

@@ -154,6 +154,13 @@ export class ApiStorage {
     return data;
   }
 
+  // Журнал запросов сервера: владельцу и админам - весь, участнику - его собственный
+  async audit({ after = 0, since = 0, limit = 200 } = {}) {
+    const { r, data } = await this.req('GET', `api/audit?after=${after}&since=${since}&limit=${limit}`);
+    if (!r.ok) throw ApiStorage.fail(r, data);
+    return data.rows;
+  }
+
   // Новая ссылка команды (только владелец). Старая сразу перестаёт работать.
   async rotateTeamSecret(secret) {
     const { r, data } = await this.req('POST', 'api/team-secret', JSON.stringify({ teamHash: await sha256b64(secret) }));
