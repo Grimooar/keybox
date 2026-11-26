@@ -27,7 +27,10 @@ for (const k of ['log', 'warn', 'error', 'info', 'debug']) {
 
 const db = new MemoryStore();
 const env = { SETUP_CODE: 'setup-code-dir', ALLOWED_ORIGINS: 'https://grimooar.github.io', AUDIT_SALT: 'audit-salt-' + C.randomHex(8) };
-const fetchFn = (url, opts) => handle(new Request(url, opts), db, env);
+// fakeIp - адрес клиента, как его подставляет Cloudflare (CF-Connecting-IP), для подписанных запросов через ApiStorage
+let fakeIp = null;
+const fetchFn = (url, opts = {}) => handle(new Request(url, fakeIp ? { ...opts, headers: { ...Object.fromEntries(new Headers(opts.headers)), 'CF-Connecting-IP': fakeIp } } : opts), db, env);
+const deniedN = (route, status) => [...db.denied].filter(([k]) => { const [, r, s] = JSON.parse(k); return r === route && s === status; }).reduce((a, [, n]) => a + n, 0);
 const BASE = 'https://api.test';
 const TEAM = C.b64e(C.randomBytes(24));
 const api = () => new ApiStorage(BASE, TEAM, fetchFn);
@@ -163,7 +166,7 @@ await test('удаление сервиса: доступ пропадает, к
   assert.deepEqual(dir.collections().map(c => c.cid), [dirCol]);
 });
 
-await test('журнал: кто, что, когда - по каждому запросу, с отказами', async () => {
+await test('журнал: кто, что, когда - по каждому запросу проверенного участника', async () => {
   const before = db.audit.length;
   await dir.refresh();
   await dir.loadAll();
@@ -171,17 +174,18 @@ await test('журнал: кто, что, когда - по каждому за�
   const rows = db.audit.slice(before);
   const vaultRead = rows.find(r => r.route === 'api/f/vault/*' && r.target === dirCol && r.uid === dir.me.uid);
   assert.ok(vaultRead && vaultRead.method === 'GET' && vaultRead.status === 200);
+  // Отказ в доступе к чужой коллекции - тоже строка: подпись верная, участник известен
   const denied = rows.find(r => r.target === other);
-  assert.equal(denied.status, 403);
-  // Файл команды читается без подписи (по секрету команды) - uid в такой строке пустой
-  assert.ok(rows.some(r => r.route === 'api/f/org.json' && r.uid === null && r.status === 200));
+  assert.deepEqual([denied.uid, denied.status], [dir.me.uid, 403]);
+  // Файл команды читается без подписи (по секрету команды) - такой запрос строки не даёт
+  assert.ok(rows.every(r => r.uid === dir.me.uid));
   assert.ok(rows.every(r => Number.isSafeInteger(r.ts) && r.ip && r.ip !== 'local'));
-  // Неверный вход тоже в журнале, но uid («кто») пустой: чей вход пробовали - только в target
+  // Неверный вход - только счётчик; верный - строка с uid
+  const beforeBad = db.audit.length;
   await V.unlock(api(), owner.me.uid, 'wrong-pass', dev()).catch(() => {});
-  const bad = db.audit.at(-1);
-  assert.deepEqual([bad.route, bad.uid, bad.target, bad.status], ['api/login', null, owner.me.uid, 401]);
+  assert.equal(db.audit.length, beforeBad);
+  assert.ok(deniedN('api/login', 401) >= 1);
   db.attempts.clear();
-  // Верный пароль - uid заполнен
   await V.unlock(api(), owner.me.uid, 'owner-pass', dev());
   const good = db.audit.findLast(r => r.route === 'api/login');
   assert.deepEqual([good.uid, good.target, good.status], [owner.me.uid, owner.me.uid, 200]);
@@ -189,30 +193,28 @@ await test('журнал: кто, что, когда - по каждому за�
 
 const H = (extra = {}) => ({ 'X-KB-Team': TEAM, Origin: 'https://grimooar.github.io', ...extra });
 
-await test('журнал: заявка с чужим uid в пути не подставляет «кто»', async () => {
+await test('журнал: заявка с чужим uid и неверным приглашением - без строки', async () => {
   const fakeUid = C.randomHex(16);
   const before = db.audit.length;
   const r = await fetchFn(BASE + '/api/f/users/' + fakeUid + '.json', { method: 'PUT', headers: H({ 'X-KB-Invite': 'bad-token' }), body: '{}' });
   assert.ok(r.status >= 400);
-  const row = db.audit.at(-1);
-  assert.equal(db.audit.length, before + 1);
-  assert.deepEqual([row.route, row.uid, row.target], ['api/f/users/*', null, fakeUid]);
+  assert.equal(db.audit.length, before);
+  assert.ok(db.audit.every(a => a.uid !== fakeUid && a.target !== fakeUid));
 });
 
-await test('журнал: пустой uid у запросов без подписи и у отказов подписи', async () => {
-  const before = db.audit.length;
+await test('журнал: верный секрет команды и мусорная подпись - ни одной строки, сколько ни шли', async () => {
+  const before = db.audit.length, lastId = db.auditId;
+  const was = deniedN('api/f/vault/*', 401);
+  for (let i = 0; i < 300; i++) {
+    const sig = C.b64e(C.randomBytes(64));
+    await fetchFn(BASE + '/api/f/vault/' + general + '.json', { headers: H({ 'X-KB-Auth': `${owner.me.uid}:${Date.now()}:${sig}` }) });
+  }
   await fetchFn(BASE + '/api/people', { headers: H() });
   await fetchFn(BASE + '/api/prelogin/' + owner.me.uid, { headers: H() });
   await fetchFn(BASE + '/api/f/org.json', { headers: H() });
-  // Подпись от имени владельца, но неверная: uid в заголовке - не повод писать его как «кто»
-  await fetchFn(BASE + '/api/f/vault/' + general + '.json', { headers: H({ 'X-KB-Auth': `${owner.me.uid}:${Date.now()}:AAAA` }) });
-  const rows = db.audit.slice(before).map(r => [r.route, r.uid, r.target, r.status]);
-  assert.deepEqual(rows, [
-    ['api/people', null, null, 200],
-    ['api/prelogin/*', null, owner.me.uid, 200],
-    ['api/f/org.json', null, null, 200],
-    ['api/f/vault/*', null, general, 401],
-  ]);
+  assert.equal(db.audit.length, before);
+  assert.equal(db.auditId, lastId);
+  assert.equal(deniedN('api/f/vault/*', 401) - was, 300);
 });
 
 await test('журнал: без секрета команды и на неизвестный путь - только счётчик, не строки', async () => {
@@ -233,21 +235,43 @@ await test('журнал: без секрета команды и на неиз�
   assert.equal((await dir.s.req('GET', 'api/audit?limit=1')).data.denied, undefined);
 });
 
-await test('журнал: потолок строк AUDIT_MAX_ROWS', async () => {
-  const saved = db.audit;
-  env.AUDIT_MAX_ROWS = '5';
+await test('журнал: участник не вытесняет чужие строки (потолок на uid)', async () => {
+  env.AUDIT_UID_ROWS = '5';
+  env.AUDIT_TRIM_EVERY = '1';
   try {
-    for (let i = 0; i < 12; i++) await fetchFn(BASE + '/api/people', { headers: H() });
-    assert.equal(db.audit.length, 5);
-    assert.ok(db.audit.every(r => r.route === 'api/people'));
-  } finally { delete env.AUDIT_MAX_ROWS; db.audit = [...saved, ...db.audit]; }
+    const ownerRows = () => db.audit.filter(a => a.uid === owner.me.uid).map(a => a.id);
+    const keep = ownerRows();
+    assert.ok(keep.length > 5);
+    for (let i = 0; i < 40; i++) await dir.s.req('GET', 'api/audit?limit=1');
+    assert.equal(db.audit.filter(a => a.uid === dir.me.uid).length, 5);
+    assert.deepEqual(ownerRows(), keep);
+    assert.ok(db.audit.filter(a => a.uid === dir.me.uid).every(a => a.route === 'api/audit'));
+  } finally { delete env.AUDIT_UID_ROWS; delete env.AUDIT_TRIM_EVERY; }
 });
 
-await test('журнал: без AUDIT_SALT адрес не пишется вовсе', async () => {
+await test('журнал: квота строк на участника в сутки, сверх - одна отметка и счётчик', async () => {
+  const today = db.auditCount.get(dir.me.uid).n_day;
+  env.AUDIT_UID_DAY = String(today + 3);
+  try {
+    const before = db.audit.length, was = deniedN('quota:api/audit', 200);
+    for (let i = 0; i < 10; i++) await dir.s.req('GET', 'api/audit?limit=1');
+    const rows = db.audit.slice(before);
+    assert.deepEqual(rows.map(r => r.route), ['api/audit', 'api/audit', 'api/audit', 'audit-quota']);
+    assert.ok(rows.every(r => r.uid === dir.me.uid));
+    assert.equal(deniedN('quota:api/audit', 200) - was, 7);
+    // Квота - своя у каждого: владелец пишется как обычно
+    await owner.s.req('GET', 'api/audit?limit=1');
+    assert.equal(db.audit.at(-1).uid, owner.me.uid);
+  } finally { delete env.AUDIT_UID_DAY; }
+});
+
+await test('журнал: без AUDIT_SALT адрес - пустая строка', async () => {
   const salt = env.AUDIT_SALT;
   delete env.AUDIT_SALT;
-  try { await fetchFn(BASE + '/api/people', { headers: { 'X-KB-Team': TEAM, 'CF-Connecting-IP': '203.0.113.9' } }); } finally { env.AUDIT_SALT = salt; }
-  assert.equal(db.audit.at(-1).ip, null);
+  fakeIp = '203.0.113.9';
+  try { await dir.s.req('GET', 'api/audit?limit=1'); } finally { env.AUDIT_SALT = salt; fakeIp = null; }
+  assert.equal(db.audit.at(-1).uid, dir.me.uid);
+  assert.equal(db.audit.at(-1).ip, '');
 });
 
 await test('журнал: участник читает только свои строки, владелец - все', async () => {
@@ -263,21 +287,32 @@ await test('журнал: участник читает только свои с
 });
 
 await test('журнал: адрес хранится только как HMAC, старые строки удаляются', async () => {
-  await fetchFn(BASE + '/api/people', { headers: { 'X-KB-Team': TEAM, 'CF-Connecting-IP': '203.0.113.7' } });
-  const row = db.audit.at(-1);
-  assert.equal(row.route, 'api/people');
-  assert.ok(!JSON.stringify(row).includes('203.0.113.7'));
-  assert.notEqual(row.ip, (await fetchFn(BASE + '/api/people', { headers: { 'X-KB-Team': TEAM, 'CF-Connecting-IP': '203.0.113.8' } }), db.audit.at(-1).ip));
+  fakeIp = '203.0.113.7';
+  try {
+    await dir.s.req('GET', 'api/audit?limit=1');
+    const row = db.audit.at(-1);
+    assert.deepEqual([row.route, row.uid], ['api/audit', dir.me.uid]);
+    assert.ok(row.ip && !JSON.stringify(row).includes('203.0.113.7'));
+    fakeIp = '203.0.113.8';
+    await dir.s.req('GET', 'api/audit?limit=1');
+    assert.notEqual(row.ip, db.audit.at(-1).ip);
+  } finally { fakeIp = null; }
   // Срок хранения: строки старше AUDIT_DAYS уходят при попутной чистке
-  db.audit.unshift({ id: 0, ts: Date.now() - 400 * 24 * 3600 * 1000, uid: null, method: 'GET', route: 'other', target: null, status: 404, ip: 'x' });
-  await fetchFn(BASE + '/api/people', { headers: { 'X-KB-Team': TEAM } });
+  db.audit.unshift({ id: 0, ts: Date.now() - 400 * 24 * 3600 * 1000, uid: owner.me.uid, method: 'GET', route: 'api/audit', target: null, status: 200, ip: 'x' });
+  await dir.s.req('GET', 'api/audit?limit=1');
   assert.ok(db.audit.every(a => a.id !== 0));
 });
 
-await test('журнал: сломанный журнал не ломает запросы', async () => {
+await test('журнал: сломанный журнал не ломает запросы и считается в счётчике', async () => {
   const add = db.addAudit;
-  db.addAudit = async () => { throw new Error('no such table: audit'); };
-  try { await dir.refresh(); } finally { db.addAudit = add; }
+  const was = deniedN('audit-error:api/f/vault/*', 200);
+  db.addAudit = async () => { throw new Error('NOT NULL constraint failed: audit.ip'); };
+  try { await dir.refresh(); await dir.loadAll(); } finally { db.addAudit = add; }
+  assert.ok(deniedN('audit-error:api/f/vault/*', 200) > was);
+  // Нет и таблицы счётчика - запрос всё равно отвечает
+  const count = db.countDenied;
+  db.addAudit = db.countDenied = async () => { throw new Error('no such table'); };
+  try { await dir.loadAll(); } finally { db.addAudit = add; db.countDenied = count; }
 });
 
 await test('в журнале нет секретов: ни паролей, ни шифртекста, ни подписей, ни секрета команды', async () => {

@@ -31,10 +31,13 @@ const SEND_NEW_LIMITS = [
 ];
 const SEND_PATH = /^api\/sends\/([0-9a-f]{32})$/;
 // Журнал запросов: кто, что, когда. Только класс пути и объект - без тел, заголовков, параметров и id отправок
-// Строка - только запросу с верным секретом команды на известный путь; остальное - счётчик за день
-// (день, класс пути, код ответа), так перебор адресов и чужие запросы не раздувают таблицу.
+// Строка - только запросу проверенного участника (подпись, верный пароль, принятая заявка) на известный путь;
+// остальное - счётчик за день (день, класс пути, код ответа): секрет команды есть у всех, включая удалённых,
+// и запросы с ним без подписи не должны вытеснять настоящие строки.
+// У каждого участника своя квота строк в сутки и свой потолок: вытесняются только его же старые строки.
 const AUDIT_DAYS = 180;
-const AUDIT_MAX_ROWS = 200000; // потолок строк: старше - удаляются при каждой записи
+const AUDIT_UID_DAY = 2000;   // строк на участника в сутки; сверх - счётчик quota:<путь> и одна строка audit-quota
+const AUDIT_UID_ROWS = 20000; // потолок строк одного участника (чистится раз в AUDIT_TRIM_EVERY его строк, см. db.js)
 const DAY = 24 * 3600 * 1000;
 const AUDIT_PAGE = { def: 200, max: 1000 };
 const AUDIT_FIXED = new Set(['api/setup', 'api/people', 'api/login', 'api/f/org.json', 'api/invites', 'api/team-secret', 'api/sends', 'api/list/users', 'api/audit']);
@@ -98,9 +101,9 @@ export async function handle(request, db, env) {
   });
 
   if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
-  // Для журнала, заполняет route: row - запрос с верным секретом команды (иначе только счётчик),
-  // uid - кто (только проверенный: подпись или верный пароль), target - чей вход пробовали
-  const who = { uid: null, row: false, target: null };
+  // Для журнала, заполняет route: uid - кто (только проверенный: подпись, верный пароль, принятая заявка;
+  // без него - только счётчик), target - чей файл или вход
+  const who = { uid: null, target: null };
   let response;
   if (!originOk && !['GET', 'HEAD'].includes(request.method)) {
     response = json(403, { error: 'Чужой источник запроса' });
@@ -123,7 +126,8 @@ export async function handle(request, db, env) {
 
 const envInt = (v, def) => (Number.isSafeInteger(Number(v)) && Number(v) > 0 ? Number(v) : def);
 
-// Строка журнала. Ошибка журнала (например, таблицы ещё нет после деплоя) запрос не ломает.
+// Строка журнала. Ошибка журнала (например, таблицы ещё нет после деплоя) запрос не ломает,
+// но и не теряется молча: считается в audit_denied как audit-error:<путь>.
 async function audit(db, env, request, url, who, status) {
   const path = url.pathname.replace(/^\/+/, '');
   if (path === 'api/status' || !db.addAudit) return;
@@ -134,20 +138,22 @@ async function audit(db, env, request, url, who, status) {
     if (m) { routeName = name; target = m[1] ?? null; break; }
   }
   if (isUid(who.target)) target = who.target;
+  const now = sendNow(env);
+  const before = now - envInt(env.AUDIT_DAYS, AUDIT_DAYS) * DAY;
+  const count = route => db.countDenied({ day: Math.floor(now / DAY), route, status }, Math.floor(before / DAY));
   try {
-    const now = sendNow(env);
-    const before = now - envInt(env.AUDIT_DAYS, AUDIT_DAYS) * DAY;
-    if (!who.row || routeName === 'other') {
-      await db.countDenied({ day: Math.floor(now / DAY), route: routeName, status }, Math.floor(before / DAY));
-      return;
-    }
+    if (!isUid(who.uid) || routeName === 'other') return await count(routeName);
     // Адрес - HMAC с AUDIT_SALT из секретов Workers (не из базы: по дампу базы IPv4 перебирается за минуты).
-    // Без AUDIT_SALT адрес не пишем вовсе.
+    // Без AUDIT_SALT адрес пустой ('' - столбец NOT NULL DEFAULT '' в любой версии схемы).
     const ip = request.headers.get('CF-Connecting-IP') || 'local';
-    const ipHash = env.AUDIT_SALT ? await hmacB64(env.AUDIT_SALT, 'ip:' + ip, 12) : null;
-    await db.addAudit({ ts: now, uid: isUid(who.uid) ? who.uid : null, method: request.method.slice(0, 8), route: routeName, target, status, ip: ipHash },
-      { before, keep: envInt(env.AUDIT_MAX_ROWS, AUDIT_MAX_ROWS) });
-  } catch { /* журнал - не повод отказать в запросе */ }
+    const ipHash = env.AUDIT_SALT ? await hmacB64(env.AUDIT_SALT, 'ip:' + ip, 12) : '';
+    const res = await db.addAudit({ ts: now, uid: who.uid, method: request.method.slice(0, 8), route: routeName, target, status, ip: ipHash },
+      { before, perDay: envInt(env.AUDIT_UID_DAY, AUDIT_UID_DAY), keep: envInt(env.AUDIT_UID_ROWS, AUDIT_UID_ROWS), trimEvery: envInt(env.AUDIT_TRIM_EVERY, undefined) });
+    if (res === 'quota') await count('quota:' + routeName);
+  } catch (e) {
+    console.error('Журнал не записан:', e?.name);
+    try { await count('audit-error:' + routeName); } catch { /* таблицы журнала нет вовсе - запрос всё равно отвечает */ }
+  }
 }
 
 async function hmacB64(secret, text, bytes = 32) {
@@ -182,24 +188,15 @@ async function route(request, url, db, env, who = {}) {
   if (path === 'api/status' && method === 'GET') {
     return { body: { team: !!(await db.meta('pin')) } };
   }
-  // До секрета команды строку журнала получают только удачные запросы: создание команды и открытие отправки
-  if (path === 'api/setup' && method === 'POST') {
-    const res = await setup(db, env, body);
-    who.row = true;
-    return res;
-  }
+  // Удачное создание команды - строка от имени владельца; открытие отправки (кем угодно по ссылке) - только счётчик
+  if (path === 'api/setup' && method === 'POST') return setup(db, env, body, who);
   const sendM = path.match(SEND_PATH);
-  if (sendM && method === 'GET') {
-    const res = await openSend(db, env, sendM[1], request.headers.get('CF-Connecting-IP') || 'local');
-    who.row = true;
-    return res;
-  }
+  if (sendM && method === 'GET') return openSend(db, env, sendM[1], request.headers.get('CF-Connecting-IP') || 'local');
 
-  // Дальше - только с секретом команды
+  // Дальше - только с секретом команды (сам по себе он строку журнала не даёт: он есть у всех)
   const teamHash = await db.meta('team');
   if (!teamHash) fail(404, 'Команда ещё не создана');
   if (!safeEqual(await sha(request.headers.get('X-KB-Team') || ''), teamHash)) fail(403, 'Неверная ссылка команды');
-  who.row = true;
 
   const pin = JSON.parse(await db.meta('pin'));
   const ctx = { db, env, pin, orgId: pin.orgId, ip: request.headers.get('CF-Connecting-IP') || 'local' };
@@ -249,7 +246,7 @@ async function route(request, url, db, env, who = {}) {
 
 // ---------- создание команды (один раз, по коду из настроек сервера) ----------
 
-async function setup(db, env, body) {
+async function setup(db, env, body, who) {
   if (await db.meta('pin')) fail(409, 'Команда уже создана');
   const req = parseJson(body);
   if (!env.SETUP_CODE || !safeEqual(String(req.setupCode || ''), env.SETUP_CODE)) fail(403, 'Неверный код установки');
@@ -266,6 +263,7 @@ async function setup(db, env, body) {
   const { authHash, ...stored } = user;
   const ok = await db.setupAll({ pin: JSON.stringify(pin), teamHash: req.teamHash, uid: user.uid, userBody: JSON.stringify(stored), authHash, orgBody: req.org });
   if (!ok) fail(409, 'Команда уже создана');
+  who.uid = user.uid;
   return { status: 201, body: { ok: true } };
 }
 
@@ -525,7 +523,7 @@ async function readAudit(ctx, url) {
   if (![after, since, limit].every(Number.isSafeInteger) || after < 0 || since < 0 || limit < 1) fail(400, 'Неверные параметры');
   const uid = ['owner', 'admin'].includes(ctx.me.role) ? null : ctx.me.uid;
   const rows = await ctx.db.listAudit({ uid, after, since, limit: Math.min(limit, AUDIT_PAGE.max) });
-  // Счётчик запросов без строки журнала (без секрета команды, на неизвестный путь) - только владельцу и админам
+  // Счётчик запросов без строки журнала (без проверенного участника, неизвестный путь, сверх квоты) - только владельцу и админам
   if (uid !== null) return { body: { rows } };
   return { body: { rows, denied: await ctx.db.listDenied({ sinceDay: Math.floor(since / DAY) }) } };
 }

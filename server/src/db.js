@@ -1,6 +1,9 @@
 // Хранилище сервера. put(path, body, rev) - запись «если версия не изменилась»:
 // rev = null - только создать; возвращает новую версию или null при конфликте.
 
+const DAY = 24 * 3600 * 1000;
+const AUDIT_TRIM_EVERY = 256; // потолок строк участника проверяется раз в столько его строк
+
 export class D1Store {
   constructor(d1) { this.d1 = d1; }
 
@@ -90,14 +93,25 @@ export class D1Store {
   async delSend(id) { await this.d1.prepare('DELETE FROM sends WHERE id = ?').bind(id).run(); }
 
   // ---------- журнал запросов ----------
-  // Строка + чистка: старше срока (по индексу ts) и сверх потолка строк (по id) - отдельными запросами, чтобы шли по индексам
-  async addAudit(r, { before, keep }) {
-    await this.d1.batch([
+  // Строка проверенного участника. Квота и потолок - на uid: счётчик в audit_count (строка на участника),
+  // сверх perDay за сутки - одна строка audit-quota и дальше ничего ('quota'); чистка: старше срока (по индексу ts)
+  // и сверх keep строк этого же участника (по индексу uid, id) - раз в trimEvery его строк, чтобы не читать индекс каждый раз
+  async addAudit(r, { before, perDay, keep, trimEvery = AUDIT_TRIM_EVERY }) {
+    const c = await this.d1.prepare(`INSERT INTO audit_count (uid, day, n_day, n_all) VALUES (?1, ?2, 1, 1)
+      ON CONFLICT (uid) DO UPDATE SET n_day = CASE WHEN day = ?2 THEN n_day + 1 ELSE 1 END, day = ?2, n_all = n_all + 1
+      RETURNING n_day, n_all`).bind(r.uid, Math.floor(r.ts / DAY)).first();
+    if (c.n_day > perDay + 1) return 'quota';
+    const row = c.n_day > perDay ? { ...r, route: 'audit-quota', target: null } : r;
+    const list = [
       this.d1.prepare('INSERT INTO audit (ts, uid, method, route, target, status, ip) VALUES (?, ?, ?, ?, ?, ?, ?)')
-        .bind(r.ts, r.uid, r.method, r.route, r.target, r.status, r.ip),
+        .bind(row.ts, row.uid, row.method, row.route, row.target, row.status, row.ip),
       this.d1.prepare('DELETE FROM audit WHERE ts < ?').bind(before),
-      this.d1.prepare('DELETE FROM audit WHERE id <= (SELECT MAX(id) FROM audit) - ?').bind(keep),
-    ]);
+    ];
+    if (c.n_all % trimEvery === 0) {
+      list.push(this.d1.prepare('DELETE FROM audit WHERE uid = ?1 AND id <= (SELECT id FROM audit WHERE uid = ?1 ORDER BY id DESC LIMIT 1 OFFSET ?2)').bind(r.uid, keep));
+    }
+    await this.d1.batch(list);
+    return row === r ? 'row' : 'quota';
   }
   // Запросы без строки журнала - счётчик на (день, класс пути, код): таблица растёт не быстрее числа дней
   async countDenied({ day, route, status }, beforeDay) {
@@ -136,11 +150,21 @@ export class D1Store {
 
 // То же самое в памяти - для тестов
 export class MemoryStore {
-  constructor() { this.files = new Map(); this.m = new Map(); this.auth = new Map(); this.invites = new Map(); this.attempts = new Map(); this.sends = new Map(); this.audit = []; this.auditId = 0; this.denied = new Map(); }
-  async addAudit(r, { before, keep }) {
-    this.audit.push({ id: ++this.auditId, ...r });
-    const maxId = this.auditId;
-    this.audit = this.audit.filter(a => a.ts >= before && a.id > maxId - keep);
+  constructor() { this.files = new Map(); this.m = new Map(); this.auth = new Map(); this.invites = new Map(); this.attempts = new Map(); this.sends = new Map(); this.audit = []; this.auditId = 0; this.auditCount = new Map(); this.denied = new Map(); }
+  async addAudit(r, { before, perDay, keep, trimEvery = AUDIT_TRIM_EVERY }) {
+    const day = Math.floor(r.ts / DAY);
+    const c = this.auditCount.get(r.uid) || { day, n_day: 0, n_all: 0 };
+    c.n_day = c.day === day ? c.n_day + 1 : 1; c.day = day; c.n_all++;
+    this.auditCount.set(r.uid, c);
+    if (c.n_day > perDay + 1) return 'quota';
+    const row = c.n_day > perDay ? { ...r, route: 'audit-quota', target: null } : r;
+    this.audit.push({ id: ++this.auditId, ...row });
+    this.audit = this.audit.filter(a => a.ts >= before);
+    if (c.n_all % trimEvery === 0) {
+      const own = this.audit.filter(a => a.uid === r.uid);
+      if (own.length > keep) { const cut = own.at(-keep - 1).id; this.audit = this.audit.filter(a => a.uid !== r.uid || a.id > cut); }
+    }
+    return row === r ? 'row' : 'quota';
   }
   async countDenied({ day, route, status }, beforeDay) {
     const k = JSON.stringify([day, route, status]);
