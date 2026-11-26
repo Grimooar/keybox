@@ -13,9 +13,9 @@
 // Пароль или код 2FA получает только дочерний процесс (kb run / kb totp) через переменную окружения.
 
 import { createRequire } from 'node:module';
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, win32 } from 'node:path';
 
 const require = createRequire(import.meta.url);
 globalThis.hashwasm ??= require('../vendor/argon2.umd.min.js');
@@ -26,8 +26,10 @@ const { ApiStorage, ApiError, NetworkError } = await import('../js/storage.js');
 const { generatePassword, totpCode } = await import('../js/tools.js');
 const { API_URL } = await import('../js/config.js');
 
-// Эти переменные дочернему процессу не передаются: программа, которой нужен один пароль, не получает ключи участника
+// Ключи участника. Дочернему процессу не передаётся ни одна переменная KB_* в любом регистре
+// (на Windows kb_sign_sk и KB_SIGN_SK - одна переменная): программа, которой нужен один пароль, ключей не получает
 export const CRED_VARS = ['KB_API', 'KB_UID', 'KB_SIGN_SK', 'KB_BOX_SK', 'KB_TEAM_SECRET', 'KB_PIN', 'KB_MASTER'];
+const isKbVar = k => /^kb_/i.test(k);
 const FIELDS = ['password', 'username', 'totp'];
 const SCAN_MAX = 50 * 1024 * 1024;
 
@@ -166,10 +168,33 @@ function newSecret(io, opts) {
 }
 
 // Окружение дочернего процесса: своё окружение без ключей участника + запрошенные значения
-function childEnv(io, values) {
-  const env = { ...io.env };
-  for (const k of CRED_VARS) delete env[k];
+export function childEnv(io, values) {
+  const env = {};
+  for (const [k, v] of Object.entries(io.env)) if (!isKbVar(k)) env[k] = v;
   return { ...env, ...values };
+}
+
+// Запуск на Windows без shell: .exe Node находит сам, а .cmd/.bat (npm, npx, свои обёртки) без shell
+// не запускаются (EINVAL). Для них - cmd.exe /d /s /v:off /c с аргументами в кавычках; аргументы
+// со спецсимволами cmd (" & | < > ^ % ! и переводы строк) отклоняем: экранировать их надёжно нельзя.
+const CMD_META = /["&|<>^%!\r\n]/;
+export function winCommand(cmd, args, { env = {}, exists = existsSync } = {}) {
+  const { basename, delimiter, extname, join } = win32; // правила путей Windows и в тестах на Linux
+  const get = name => env[Object.keys(env).find(k => k.toLowerCase() === name.toLowerCase())];
+  const exts = (get('PATHEXT') || '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean);
+  let file = cmd;
+  if (!extname(cmd) && basename(cmd) === cmd) {
+    const dirs = (get('PATH') || '').split(delimiter).filter(Boolean);
+    file = dirs.flatMap(d => exts.map(e => join(d, cmd + e))).find(p => exists(p)) || cmd;
+  } else if (!extname(cmd)) {
+    file = exts.map(e => cmd + e).find(p => exists(p)) || cmd;
+  }
+  if (!/\.(cmd|bat)$/i.test(file)) return { file, args };
+  for (const a of [file, ...args]) {
+    if (CMD_META.test(a)) throw new UsageError('Аргумент для ' + basename(file) + ' со спецсимволом cmd (" & | < > ^ % !): запустите программу напрямую, не через .cmd');
+  }
+  const line = [file, ...args].map(a => '"' + a + '"').join(' ');
+  return { file: get('ComSpec') || 'cmd.exe', args: ['/d', '/s', '/v:off', '/c', '"' + line + '"'], verbatim: true };
 }
 
 function envSpecs(opts) {
@@ -177,7 +202,7 @@ function envSpecs(opts) {
     const [name, field] = x.includes('=') ? x.split('=', 2) : [x, opts.field || 'password'];
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new UsageError('Неверное имя переменной: ' + name);
     if (!FIELDS.includes(field)) throw new UsageError('Поле: ' + FIELDS.join(', '));
-    if (CRED_VARS.includes(name)) throw new UsageError('Имя ' + name + ' занято ключами Ключницы');
+    if (isKbVar(name)) throw new UsageError('Имена KB_* заняты ключами Ключницы: ' + name);
     return { name, field };
   });
   if (!specs.length) throw new UsageError('Нужен --env <ПЕРЕМЕННАЯ>');
@@ -213,11 +238,18 @@ async function cmdEnroll(io, opts) {
     KB_TEAM_SECRET: team, KB_PIN: pinText(s.me.pin), KB_MASTER: master,
   };
   writeFileSync(opts.out, JSON.stringify(creds, null, 1) + '\n', { mode: 0o600, flag: 'wx' });
+  // На Windows mode 0o600 не действует: права - через icacls (только текущий пользователь), иначе - предупреждение
+  if ((io.platform || process.platform) === 'win32') {
+    const ok = await (async () => io.protectFile?.(opts.out))().catch(() => false);
+    io.err(ok
+      ? 'Права на ' + opts.out + ': только текущий пользователь (icacls).'
+      : 'Внимание: не удалось ограничить права на ' + opts.out + ' (icacls). Файл с ключами читают все, у кого есть доступ к папке: перенесите ключи и удалите файл сразу.');
+  }
   io.out('Заявка отправлена.');
   io.out('uid: ' + s.me.uid);
   io.out('Код участника (сверить с окном заявки у владельца): ' + await s.myCode());
   io.out('Ключи записаны в ' + opts.out + ' - перенесите их в хранилище ключей и удалите файл.');
-  io.out('Владелец: принять заявку с галочкой «Участник-сервис» и добавить в коллекцию.');
+  io.out('Владелец: коллекции «для всех» сделать «для выбранных», принять заявку с галочкой «Участник-сервис» и добавить в коллекцию.');
   return 0;
 }
 
@@ -308,10 +340,16 @@ async function cmdAudit(io, opts) {
   return 0;
 }
 
-function* walk(path) {
-  const st = statSync(path);
-  if (st.isDirectory()) for (const n of readdirSync(path)) yield* walk(join(path, n));
-  else if (st.isFile() && st.size <= SCAN_MAX) yield path;
+// Обход с защитой от циклов: папку (по настоящему пути, после симлинков) проходим один раз
+function* walk(path, seen = new Set()) {
+  let st;
+  try { st = statSync(path); } catch { return; } // битый симлинк, нет доступа
+  if (st.isDirectory()) {
+    const real = realpathSync(path);
+    if (seen.has(real)) return;
+    seen.add(real);
+    for (const n of readdirSync(path)) yield* walk(join(path, n), seen);
+  } else if (st.isFile() && st.size <= SCAN_MAX) yield path;
 }
 
 async function cmdScan(io, opts) {

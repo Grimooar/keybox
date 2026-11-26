@@ -17,7 +17,7 @@ const { ApiStorage } = await import('../js/storage.js');
 const V = await import('../js/vault.js');
 const { handle } = await import('../server/src/handler.js');
 const { MemoryStore } = await import('../server/src/db.js');
-const { main, CRED_VARS } = await import('../cli/lib.mjs');
+const { main, CRED_VARS, childEnv, winCommand } = await import('../cli/lib.mjs');
 
 let passed = 0;
 async function test(name, fn) {
@@ -96,6 +96,7 @@ await test('enroll: заявка по ссылке-приглашению, кл�
   const p = (await owner.pendingUsers()).find(x => x.uid === dirUid);
   assert.ok(p.service);
   assert.ok(r.code !== 0);
+  await owner.updateCollection(general, { all: false, members: [] }); // сервис и «для всех» не совмещаются
   await owner.approve(dirUid, p.code, [], { service: true });
   dirCol = await owner.createCollection('Директор', false, [dirUid]);
 });
@@ -195,6 +196,62 @@ await test('scan: находит значения записей в журнал
   assert.match(r.out, /«Хостинг».*leak\.log/);
   assert.ok(!r.out.includes(it.history[0].password));
   rmSync(join(logs, 'leak.log'));
+});
+
+await test('run: ни одной KB_* в любом регистре у дочернего процесса (на Windows регистр не различается)', async () => {
+  const env = childEnv({ env: { kb_sign_sk: 'a', Kb_Uid: 'b', KB_OTHER: 'c', KB_SIGN_SK: 'd', PATH: 'p', Home: 'h' } }, { PASS: 'v' });
+  assert.deepEqual(env, { PATH: 'p', Home: 'h', PASS: 'v' });
+  const NO_KB = "process.exit(Object.keys(process.env).some(k => /^kb_/i.test(k)) ? 4 : 0)";
+  const r = await kb(['run', '--item', 'Хостинг', '--env', 'PASS', '--', NODE, '-e', NO_KB], { kb_sign_sk: creds.KB_SIGN_SK, Kb_Team_Secret: creds.KB_TEAM_SECRET });
+  assert.equal(r.code, 0, r.err);
+  assert.equal((await kb(['run', '--item', 'Хостинг', '--env', 'kb_x', '--', NODE, '-e', '1'])).code, 2);
+});
+
+await test('Windows: .cmd/.bat через cmd.exe без shell, аргументы со спецсимволами - отказ', async () => {
+  const files = new Set(['C:\\bin\\npm.CMD', 'C:\\bin\\node.EXE', 'C:\\tools\\run.bat']);
+  const env = { Path: 'C:\\nope;C:\\bin', PATHEXT: '.COM;.EXE;.BAT;.CMD', ComSpec: 'C:\\Windows\\system32\\cmd.exe' };
+  const exists = p => files.has(p);
+  // .exe - напрямую
+  assert.deepEqual(winCommand('node', ['-v'], { env, exists }), { file: 'C:\\bin\\node.EXE', args: ['-v'] });
+  // .cmd по PATH и .bat по пути - через cmd.exe, каждый аргумент в кавычках
+  const c = winCommand('npm', ['run', 'build x'], { env, exists });
+  assert.equal(c.file, env.ComSpec);
+  assert.deepEqual(c.args, ['/d', '/s', '/v:off', '/c', '""C:\\bin\\npm.CMD" "run" "build x""']);
+  assert.equal(c.verbatim, true);
+  assert.equal(winCommand('C:\\tools\\run.bat', [], { env, exists }).file, env.ComSpec);
+  for (const bad of ['a&calc', 'a|b', '%PATH%', 'x"y', 'a>b', 'a^b', 'a!b', 'a\nb']) {
+    assert.throws(() => winCommand('npm', [bad], { env, exists }), /спецсимволом/, bad);
+  }
+  // Не найдено - как есть, ошибку запуска покажет spawn
+  assert.deepEqual(winCommand('nothing', [], { env, exists }), { file: 'nothing', args: [] });
+});
+
+await test('scan: симлинк на родительскую папку не зацикливает обход', async () => {
+  const fs = require('node:fs');
+  const root = join(tmp, 'loop');
+  fs.mkdirSync(join(root, 'sub'), { recursive: true });
+  writeFileSync(join(root, 'sub', 'a.log'), 'ничего\n');
+  try { fs.symlinkSync(root, join(root, 'sub', 'up'), 'junction'); } catch { console.log('       (симлинк не создать - проверка пропущена)'); return; }
+  const r = await kb(['scan', root]);
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /scan: чисто/);
+});
+
+await test('enroll на Windows: права через icacls или явное предупреждение', async () => {
+  const code = (await V.teamCode(owner.org)).replace(/\D/g, '');
+  const run = async (n, io) => {
+    const err = [];
+    const token = (await owner.s.createInvite()).token;
+    const r = await main(['enroll', '--link', `https://app/#t=${TEAM}&c=${code}&i=${token}`, '--name', 'Сервис ' + n, '--out', join(tmp, 'win' + n + '.json')],
+      { env: { KB_API: BASE, KB_STATE_DIR: join(tmp, 'state-w' + n) }, fetch: fetchFn, out: () => {}, err: l => err.push(l), spawn: spawnChild, ...io });
+    assert.equal(r, 0, err.join('\n'));
+    return err.join('\n');
+  };
+  const protectedPaths = [];
+  assert.match(await run(1, { platform: 'win32', protectFile: p => (protectedPaths.push(p), true) }), /только текущий пользователь/);
+  assert.deepEqual(protectedPaths, [join(tmp, 'win1.json')]);
+  assert.match(await run(2, { platform: 'win32', protectFile: () => { throw new Error('icacls'); } }), /Внимание: не удалось ограничить права/);
+  assert.equal(await run(3, { platform: 'linux' }), '');
 });
 
 await test('ошибки: без ключей - подсказка, без значений', async () => {
