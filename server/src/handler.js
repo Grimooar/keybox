@@ -8,7 +8,7 @@
 //   X-KB-Invite - токен приглашения (только для заявки на вступление)
 
 import * as C from '../../js/crypto.js';
-import { verifyOrg, accessOf, isUid } from '../../js/vault.js';
+import { verifyOrg, accessOf, isUid, isService } from '../../js/vault.js';
 
 const ORG = 'org.json';
 const MAX_BODY = 2 * 1024 * 1024;
@@ -53,7 +53,7 @@ function safeEqual(a, b) {
 
 const vaultPayload = (orgId, f) => ({ t: 'vault', orgId, cid: f.cid, keyVersion: f.keyVersion, seq: f.seq, data: f.data, signer: f.signer });
 const selfPayload = (f, orgId) => ({ t: 'user', orgId, uid: f.uid, name: f.name, boxPk: f.boxPk, signPk: f.signPk });
-const publicUser = f => ({ v: f.v, uid: f.uid, name: f.name, boxPk: f.boxPk, signPk: f.signPk, selfSig: f.selfSig, createdAt: f.createdAt });
+const publicUser = f => ({ v: f.v, uid: f.uid, name: f.name, boxPk: f.boxPk, signPk: f.signPk, selfSig: f.selfSig, createdAt: f.createdAt, ...(f.kind === 'service' ? { kind: 'service' } : {}) });
 
 function parseJson(text) {
   try { return JSON.parse(text); } catch { return fail(400, 'Неверный JSON'); }
@@ -306,7 +306,12 @@ async function identify(ctx, request, method, fullPath, body) {
     if (usedSigs.has(sig)) fail(401, 'Повтор запроса');
     usedSigs.set(sig, Number(ts) + CLOCK_SKEW);
   }
-  return { uid, role, pk };
+  return { uid, role, pk, service: role === 'member' && isService(ctx.org.members[uid]) };
+}
+
+// Участнику-сервису - только коллекции, куда его добавили: без личного сейфа, отправок и чужих файлов
+function denyService(ctx, what) {
+  if (ctx.me.service) fail(403, 'Участнику-сервису нельзя: ' + what);
 }
 
 function requireAdmin(ctx) {
@@ -314,7 +319,7 @@ function requireAdmin(ctx) {
 }
 
 function canReadVault(ctx, cid) {
-  if (cid.startsWith('p-')) return cid.slice(2) === ctx.me.uid;
+  if (cid.startsWith('p-')) return cid.slice(2) === ctx.me.uid && !ctx.me.service;
   const col = ctx.org.collections[cid];
   return !!col && ctx.me.role !== 'pending' && accessOf(ctx.org, col).includes(ctx.me.uid);
 }
@@ -329,6 +334,7 @@ async function readFile(ctx, file, uid, cid) {
     // Зашифрованные ключи - только самому участнику; остальным - публичная часть (для одобрения заявки)
     if (uid === ctx.me.uid) return { body: { text: row.body }, rev: row.rev };
     if (ctx.me.role === 'pending') fail(403, 'Нет доступа');
+    denyService(ctx, 'файлы других участников');
     return { body: { text: JSON.stringify(publicUser(JSON.parse(row.body))) }, rev: row.rev };
   }
   if (!canReadVault(ctx, cid)) fail(403, 'Нет доступа к коллекции');
@@ -356,6 +362,10 @@ async function writeOrg(ctx, body, rev) {
   const seen = { get: () => ({ version: ctx.org.version + 1, certVersion: ctx.org.adminCert.certVersion }) };
   await verifyOrg(next, ctx.pin, seen).catch(e => fail(400, 'Файл команды не прошёл проверку: ' + e.message));
   if (next.signer !== ctx.me.uid) fail(400, 'Подписано не вами');
+  // Сервис остаётся сервисом: расширить ему права нельзя, только удалить и принять заново
+  for (const [uid, m] of Object.entries(ctx.org.members)) {
+    if (isService(m) && Object.hasOwn(next.members, uid) && !isService(next.members[uid])) fail(400, 'Участник-сервис «' + m.name + '» не может стать обычным участником');
+  }
   // Ключи каждого участника - те, что он сам прислал при вступлении (файл участника меняет только он).
   // Так админ не может подставить свой ключ вместо чужого и действовать от имени участника.
   for (const [uid, m] of Object.entries(next.members)) {
@@ -387,6 +397,7 @@ async function writeVault(ctx, cid, body, rev) {
   const f = parseJson(body);
   if (f.cid !== cid || f.signer !== ctx.me.uid || !Number.isSafeInteger(f.seq) || !Number.isSafeInteger(f.keyVersion)) fail(400, 'Неверный файл коллекции');
   if (cid.startsWith('p-')) {
+    denyService(ctx, 'личный сейф');
     if (cid.slice(2) !== ctx.me.uid || f.keyVersion !== 1) fail(403, 'Чужой личный сейф');
   } else {
     if (!canReadVault(ctx, cid)) fail(403, 'Нет доступа к коллекции');
@@ -426,6 +437,7 @@ const intIn = (v, r) => (v == null ? r.def : Number.isSafeInteger(v) && v >= r.m
 
 async function createSend(ctx, body) {
   if (ctx.me.role === 'pending') fail(403, 'Только для участников команды');
+  denyService(ctx, 'отправка секрета');
   const req = parseJson(body);
   if (typeof req?.body !== 'string' || !req.body || req.body.length > SEND_MAX) fail(413, 'Слишком большой текст');
   const ttl = intIn(req.ttlSec, SEND_TTL);

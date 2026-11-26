@@ -72,10 +72,14 @@ function adminsOf(org) {
   return out;
 }
 
-// Кто получает ключ коллекции: «для всех» - вся команда, иначе выбранные + владелец и админы
+// Участник-сервис (программа, например Директор): роль member и флаг service.
+// Без личного сейфа, отправок и коллекций «для всех» - только то, куда его добавили явно.
+export const isService = m => m?.role === 'member' && m.service === true;
+
+// Кто получает ключ коллекции: «для всех» - вся команда, кроме сервисов, иначе выбранные + владелец и админы
 export function accessOf(org, col) {
   const uids = Object.keys(org.members);
-  if (col.all) return uids;
+  if (col.all) return uids.filter(uid => !isService(org.members[uid]));
   return uids.filter(uid => col.members.includes(uid) || org.members[uid].role !== 'member');
 }
 
@@ -111,6 +115,7 @@ export async function verifyOrg(org, pin, seen) {
       ? certified?.signPk !== m.signPk || certified?.boxPk !== m.boxPk
       : certified !== undefined) throw fake();
     if (m.role === 'owner' && uid !== org.owner.uid) throw fake();
+    if (m.service !== undefined && !isService(m)) throw fake();
   }
   for (const uid of Object.keys(c.admins)) if (!Object.hasOwn(org.members, uid)) throw fake();
 
@@ -120,6 +125,8 @@ export async function verifyOrg(org, pin, seen) {
     if (!/^[0-9a-f]{24}$/.test(cid) || !isVer(col?.keyVersion) || !Array.isArray(col.members) || !col.wraps || typeof col.wraps !== 'object' || !col.nameBox) throw fake();
     for (const uid of accessOf(org, col)) if (!Object.hasOwn(col.wraps, uid)) throw fake();
     for (const uid of Object.keys(col.wraps)) if (!Object.hasOwn(org.members, uid)) throw fake();
+    // Ключ коллекции «для всех» у сервиса - лишний доступ, такой файл не принимаем
+    if (col.all) for (const uid of Object.keys(col.wraps)) if (isService(org.members[uid])) throw fake();
   }
 
   const last = seen?.get(org.orgId);
@@ -242,7 +249,8 @@ export async function createTeam(storage, { teamName, userName, password, seen, 
 }
 
 // Заявка на вступление: создаём участника, админ подтверждает её у себя
-export async function joinTeam(storage, { userName, password, seen, expectedTeamCode }) {
+// kind: 'service' - пометка заявки участника-сервиса (подсказка админу; права задаёт он при приёме)
+export async function joinTeam(storage, { userName, password, seen, expectedTeamCode, kind }) {
   const r = await readOrg(storage);
   if (!r) throw new VaultError('В этой папке нет команды');
   const pin = { orgId: r.org.orgId, ownerSignPk: r.org.owner?.signPk, ownerBoxPk: r.org.members?.[r.org.owner?.uid]?.boxPk };
@@ -253,6 +261,7 @@ export async function joinTeam(storage, { userName, password, seen, expectedTeam
   await verifyOrg(r.org, pin, seen);
   const uid = C.randomHex(16);
   const { file, me } = await makeUser({ uid, name: userName, password, pin });
+  if (kind === 'service') file.kind = 'service';
   await storage.write(userPath(uid), JSON.stringify(file, null, 1), null);
   const s = new Session(storage, me, seen);
   await s.refresh();
@@ -344,6 +353,7 @@ export class Session {
   get role() { return this.member?.role || 'pending'; }
   get isOwner() { return this.role === 'owner'; }
   get isAdmin() { return this.role === 'owner' || this.role === 'admin'; }
+  get isService() { return isService(this.member); }
   get pending() { return !this.member; }
   get personalCid() { return personalCid(this.me.uid); }
 
@@ -405,7 +415,8 @@ export class Session {
       if (this.keys.has(cid)) list.push({ cid, name: this.names.get(cid), all: col.all });
     }
     list.sort((a, b) => (b.all - a.all) || a.name.localeCompare(b.name, 'ru'));
-    return [{ cid: this.personalCid, name: 'Личное', personal: true }, ...list];
+    // У сервиса личного сейфа нет: сервер его не отдаёт и не принимает
+    return this.isService ? list : [{ cid: this.personalCid, name: 'Личное', personal: true }, ...list];
   }
 
   collectionName(cid) {
@@ -659,13 +670,14 @@ export class Session {
       if (!r) continue;
       const f = JSON.parse(r.text);
       const valid = f.uid === uid && await C.verifyObj(f.signPk, f.selfSig, selfPayload(f, this.orgId));
-      out.push({ uid, name: f.name, createdAt: f.createdAt, valid, code: valid ? await C.fingerprint(uid, f.boxPk, f.signPk) : null });
+      // kind - только подсказка из заявки (её не подписывают): решает админ галочкой при приёме
+      out.push({ uid, name: f.name, createdAt: f.createdAt, valid, code: valid ? await C.fingerprint(uid, f.boxPk, f.signPk) : null, service: f.kind === 'service' });
     }
     return out;
   }
 
-  // code - проверочный код, который админ сверил с новым участником
-  async approve(uid, code, cids = []) {
+  // code - проверочный код, который админ сверил с новым участником; service - принять как участника-сервис
+  async approve(uid, code, cids = [], { service = false } = {}) {
     const r = await this.s.read(userPath(checkUid(uid)));
     if (!r) throw new VaultError('Заявка не найдена');
     const f = JSON.parse(r.text);
@@ -675,6 +687,7 @@ export class Session {
     }
     await this.updateOrg(d => {
       d.members[uid] = { name: f.name, role: 'member', boxPk: f.boxPk, signPk: f.signPk, addedAt: Date.now() };
+      if (service) d.members[uid].service = true;
       for (const cid of cids) {
         const col = d.collections[cid];
         if (col && !col.all && !col.members.includes(uid)) col.members.push(uid);
@@ -710,6 +723,7 @@ export class Session {
     checkUid(uid);
     if (!Object.hasOwn(this.org.members, uid)) throw new VaultError('Участник не найден');
     if (this.org.members[uid].role === 'owner') throw new VaultError('Роль владельца не меняется');
+    if (isService(this.org.members[uid])) throw new VaultError('Участник-сервис остаётся участником: админом его сделать нельзя');
     await this.updateOrg(d => { d.members[uid].role = role; });
   }
 
