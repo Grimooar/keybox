@@ -35,8 +35,11 @@ const SEND_PATH = /^api\/sends\/([0-9a-f]{32})$/;
 // остальное - счётчик за день (день, класс пути, код ответа): секрет команды есть у всех, включая удалённых,
 // и запросы с ним без подписи не должны вытеснять настоящие строки.
 // У каждого участника своя квота строк в сутки и свой потолок: вытесняются только его же старые строки.
+// Квота ограничивает чтения; записи и удаления (всё, кроме GET и входа) - своя квота, в разы выше.
+// Сверх квоты - одна отметка audit-quota[-write] и счётчик quota:<uid>:<путь>: видно, кто и что делал дальше.
 const AUDIT_DAYS = 180;
-const AUDIT_UID_DAY = 2000;   // строк на участника в сутки; сверх - счётчик quota:<путь> и одна строка audit-quota
+const AUDIT_UID_DAY = 2000;   // чтений со строкой на участника в сутки
+const AUDIT_UID_WRITE_DAY = 10000; // записей и удалений со строкой на участника в сутки
 const AUDIT_UID_ROWS = 20000; // потолок строк одного участника (чистится раз в AUDIT_TRIM_EVERY его строк, см. db.js)
 const DAY = 24 * 3600 * 1000;
 const AUDIT_PAGE = { def: 200, max: 1000 };
@@ -147,9 +150,12 @@ async function audit(db, env, request, url, who, status) {
     // Без AUDIT_SALT адрес пустой ('' - столбец NOT NULL DEFAULT '' в любой версии схемы).
     const ip = request.headers.get('CF-Connecting-IP') || 'local';
     const ipHash = env.AUDIT_SALT ? await hmacB64(env.AUDIT_SALT, 'ip:' + ip, 12) : '';
-    const res = await db.addAudit({ ts: now, uid: who.uid, method: request.method.slice(0, 8), route: routeName, target, status, ip: ipHash },
-      { before, perDay: envInt(env.AUDIT_UID_DAY, AUDIT_UID_DAY), keep: envInt(env.AUDIT_UID_ROWS, AUDIT_UID_ROWS), trimEvery: envInt(env.AUDIT_TRIM_EVERY, undefined) });
-    if (res === 'quota') await count('quota:' + routeName);
+    const write = request.method !== 'GET' && routeName !== 'api/login';
+    const res = await db.addAudit({ ts: now, uid: who.uid, method: request.method.slice(0, 8), route: routeName, target, status, ip: ipHash }, {
+      before, write, perDay: envInt(env.AUDIT_UID_DAY, AUDIT_UID_DAY), writeDay: envInt(env.AUDIT_UID_WRITE_DAY, AUDIT_UID_WRITE_DAY),
+      keep: envInt(env.AUDIT_UID_ROWS, AUDIT_UID_ROWS), trimEvery: envInt(env.AUDIT_TRIM_EVERY, undefined),
+    });
+    if (res === 'quota') await count(`quota:${who.uid}:${routeName}`);
   } catch (e) {
     console.error('Журнал не записан:', e?.name);
     try { await count('audit-error:' + routeName); } catch { /* таблицы журнала нет вовсе - запрос всё равно отвечает */ }
@@ -338,6 +344,9 @@ async function joinRequest(ctx, uid, body, token) {
   const f = parseJson(body);
   await checkNewUser(f, uid, ctx.orgId, body);
   if (Object.hasOwn(ctx.org.members, uid) || await ctx.db.get('users/' + uid)) fail(409, 'Уже есть');
+  // uid удалённого участника или отклонённой заявки не занять: иначе новый человек получил бы его журнал и квоту.
+  // До списания приглашения - отказ его не тратит
+  if (await ctx.db.isRetired(uid)) fail(409, 'Этот uid уже был в команде: создайте заявку заново');
   if (!await ctx.db.useInvite(await sha(token), Date.now())) fail(403, 'Приглашение недействительно или истекло. Попросите новое.');
   const { authHash, ...stored } = f;
   const rev = await ctx.db.put('users/' + uid, JSON.stringify(stored), null);
@@ -501,6 +510,8 @@ async function deleteFile(ctx, file, uid, cid) {
   if (file === ORG) fail(403, 'Файл команды не удаляется');
   if (uid) {
     if (Object.hasOwn(ctx.org.members, uid)) fail(409, 'Сначала удалите участника из команды');
+    // Сначала погасить uid: если дальше что-то упадёт, занять его заново всё равно нельзя
+    await ctx.db.retireUid(uid, Date.now());
     await ctx.db.del('users/' + uid);
     await ctx.db.delAuth(uid);
     await ctx.db.del('vault/p-' + uid);
@@ -523,9 +534,11 @@ async function readAudit(ctx, url) {
   if (![after, since, limit].every(Number.isSafeInteger) || after < 0 || since < 0 || limit < 1) fail(400, 'Неверные параметры');
   const uid = ['owner', 'admin'].includes(ctx.me.role) ? null : ctx.me.uid;
   const rows = await ctx.db.listAudit({ uid, after, since, limit: Math.min(limit, AUDIT_PAGE.max) });
-  // Счётчик запросов без строки журнала (без проверенного участника, неизвестный путь, сверх квоты) - только владельцу и админам
+  // Счётчик запросов без строки журнала (без проверенного участника, неизвестный путь, сверх квоты - quota:<uid>:<путь>)
+  // и запросы участников за сутки (n_day - чтения, w_day - записи, вместе со сверхквотными) - только владельцу и админам
   if (uid !== null) return { body: { rows } };
-  return { body: { rows, denied: await ctx.db.listDenied({ sinceDay: Math.floor(since / DAY) }) } };
+  const sinceDay = Math.floor(since / DAY);
+  return { body: { rows, denied: await ctx.db.listDenied({ sinceDay }), counts: await ctx.db.listAuditCount({ sinceDay }) } };
 }
 
 // ---------- одноразовая отправка секрета ----------

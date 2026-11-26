@@ -153,9 +153,26 @@ await test('файл команды новее клиента: «обновит�
 
 await test('удаление сервиса: доступ пропадает, ключ коллекции меняется', async () => {
   const ver = owner.org.collections[dirCol].keyVersion;
+  const oldUid = dir.me.uid, oldFile = JSON.parse(db.files.get('users/' + oldUid).body);
   await owner.removeMember(dir.me.uid);
   assert.equal(owner.org.collections[dirCol].keyVersion, ver + 1);
   await rejects(dir.refresh(), /удалили|удалён/);
+  // uid удалённого не занять заново даже с верным приглашением и верно подписанным файлом: отказ, приглашение цело
+  const token = (await owner.s.createInvite()).token;
+  const inv = [...db.invites.values()].at(-1), uses = inv.uses_left;
+  const again = await fetchFn(BASE + '/api/f/users/' + oldUid + '.json?rev=new', { method: 'PUT', headers: { 'X-KB-Team': TEAM, 'X-KB-Invite': token }, body: JSON.stringify({ ...oldFile, authHash: C.b64e(C.randomBytes(32)) }) });
+  assert.equal(again.status, 409);
+  assert.match((await again.json()).error, /uid уже был/);
+  assert.equal(db.files.has('users/' + oldUid), false);
+  assert.equal(inv.uses_left, uses);
+  // Отклонённая заявка - тоже погашена
+  const s2 = api();
+  s2.invite = token;
+  const rej = await V.joinTeam(s2, { userName: 'Отклонённый', password: C.b64e(C.randomBytes(24)), seen: dev() });
+  const rejFile = JSON.parse(db.files.get('users/' + rej.me.uid).body);
+  await owner.reject(rej.me.uid);
+  const again2 = await fetchFn(BASE + '/api/f/users/' + rej.me.uid + '.json?rev=new', { method: 'PUT', headers: { 'X-KB-Team': TEAM, 'X-KB-Invite': token }, body: JSON.stringify({ ...rejFile, authHash: C.b64e(C.randomBytes(32)) }) });
+  assert.equal(again2.status, 409);
   // Вернём для следующих тестов: новый участник-сервис
   const s = api();
   s.invite = (await owner.s.createInvite()).token;
@@ -249,20 +266,54 @@ await test('журнал: участник не вытесняет чужие с
   } finally { delete env.AUDIT_UID_ROWS; delete env.AUDIT_TRIM_EVERY; }
 });
 
-await test('журнал: квота строк на участника в сутки, сверх - одна отметка и счётчик', async () => {
+await test('журнал: квота строк на участника в сутки, сверх - одна отметка и счётчик с uid', async () => {
   const today = db.auditCount.get(dir.me.uid).n_day;
   env.AUDIT_UID_DAY = String(today + 3);
+  const q = 'quota:' + dir.me.uid + ':api/audit';
   try {
-    const before = db.audit.length, was = deniedN('quota:api/audit', 200);
+    const before = db.audit.length, was = deniedN(q, 200);
     for (let i = 0; i < 10; i++) await dir.s.req('GET', 'api/audit?limit=1');
     const rows = db.audit.slice(before);
     assert.deepEqual(rows.map(r => r.route), ['api/audit', 'api/audit', 'api/audit', 'audit-quota']);
     assert.ok(rows.every(r => r.uid === dir.me.uid));
-    assert.equal(deniedN('quota:api/audit', 200) - was, 7);
+    assert.equal(deniedN(q, 200) - was, 7);
     // Квота - своя у каждого: владелец пишется как обычно
     await owner.s.req('GET', 'api/audit?limit=1');
     assert.equal(db.audit.at(-1).uid, owner.me.uid);
-  } finally { delete env.AUDIT_UID_DAY; }
+    // Админ видит, сколько запросов сделал участник за сутки, вместе со сверхквотными, и счётчик - с его uid
+    const { counts, denied } = (await owner.s.req('GET', 'api/audit?limit=1')).data;
+    const mine = counts.find(c => c.uid === dir.me.uid);
+    assert.equal(mine.n_day, today + 10);
+    assert.ok(denied.some(d => d.route === q && d.n >= 7));
+    assert.equal((await dir.s.req('GET', 'api/audit?limit=1')).data.counts, undefined);
+
+    // Чтения исчерпаны, а записи и удаления - всё равно строкой (у них своя квота)
+    const w0 = db.audit.length;
+    const put = await dir.s.req('PUT', 'api/f/vault/' + other + '.json?rev=new', '{}');
+    const del = await dir.s.req('DELETE', 'api/f/users/' + owner.me.uid + '.json');
+    assert.deepEqual([put.r.status, del.r.status], [400, 403]);
+    assert.deepEqual(db.audit.slice(w0).map(r => [r.uid, r.method, r.route, r.target, r.status]), [
+      [dir.me.uid, 'PUT', 'api/f/vault/*', other, 400], [dir.me.uid, 'DELETE', 'api/f/users/*', owner.me.uid, 403]]);
+    await dir.saveItem(dirCol, item('После квоты', 'after-quota-pw'));
+    assert.ok(db.audit.slice(w0).some(r => r.method === 'PUT' && r.target === dirCol && r.status === 200));
+
+    // У записей потолок свой: сверх него - отметка audit-quota-write и счётчик quota:<uid>:<путь>
+    env.AUDIT_UID_WRITE_DAY = String(db.auditCount.get(dir.me.uid).w_day + 2);
+    // Разный query - разная подпись (одинаковая в ту же миллисекунду была бы 401 «повтор»)
+    const qw = 'quota:' + dir.me.uid + ':api/f/vault/*', wasW = deniedN(qw, 400), w1 = db.audit.length;
+    for (let i = 0; i < 6; i++) assert.equal((await dir.s.req('PUT', 'api/f/vault/' + other + '.json?rev=new&n=' + i, '{}')).r.status, 400);
+    assert.deepEqual(db.audit.slice(w1).map(r => r.route), ['api/f/vault/*', 'api/f/vault/*', 'audit-quota-write']);
+    assert.equal(deniedN(qw, 400) - wasW, 4); // отметка тоже считается, как у чтений
+  } finally { delete env.AUDIT_UID_DAY; delete env.AUDIT_UID_WRITE_DAY; }
+});
+
+await test('журнал: чистка по потолку не пропускается, если кратный запрос пришёлся на сверхквоту', async () => {
+  const m = new MemoryStore(), u = 'e'.repeat(32), DAY = 24 * 3600 * 1000;
+  const row = ts => ({ ts, uid: u, method: 'GET', route: 'api/people', target: null, status: 200, ip: '' });
+  // Квота 3 + отметка = 4 строки в сутки, чистка раз в 4 строки до 2: сверхквотные запросы n_all не двигают
+  for (let d = 1; d <= 4; d++) for (let i = 0; i < 7; i++) await m.addAudit(row(d * DAY + i), { before: 0, perDay: 3, keep: 2, trimEvery: 4 });
+  assert.equal(m.auditCount.get(u).n_all, 16);
+  assert.equal(m.audit.filter(a => a.uid === u).length, 2);
 });
 
 await test('журнал: без AUDIT_SALT адрес - пустая строка', async () => {

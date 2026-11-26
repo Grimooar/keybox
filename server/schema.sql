@@ -17,8 +17,12 @@ CREATE INDEX IF NOT EXISTS sends_expires ON sends (expires_at);
 CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, uid TEXT, method TEXT NOT NULL, route TEXT NOT NULL, target TEXT, status INTEGER NOT NULL, ip TEXT NOT NULL DEFAULT '');
 CREATE INDEX IF NOT EXISTS audit_ts ON audit (ts);
 CREATE INDEX IF NOT EXISTS audit_uid ON audit (uid, id);
--- Квота журнала на участника: строк за текущие сутки (day - номер дня с 1970) и всего (для редкой чистки потолка)
-CREATE TABLE IF NOT EXISTS audit_count (uid TEXT PRIMARY KEY, day INTEGER NOT NULL, n_day INTEGER NOT NULL, n_all INTEGER NOT NULL);
--- Запросы без строки (без проверенного участника, неизвестный путь, сверх квоты - quota:<путь>, сбой записи -
+-- Квота журнала на участника: запросов за текущие сутки (day - номер дня с 1970) - чтений n_day и записей/удалений
+-- w_day (у записей свой, более высокий потолок), и записанных строк всего n_all (для редкой чистки потолка)
+CREATE TABLE IF NOT EXISTS audit_count (uid TEXT PRIMARY KEY, day INTEGER NOT NULL, n_day INTEGER NOT NULL, w_day INTEGER NOT NULL DEFAULT 0, n_all INTEGER NOT NULL);
+-- Погашенные uid: удалённый участник или отклонённая заявка. uid задаёт сам заявитель, поэтому занять его
+-- повторно нельзя никогда - иначе новый держатель приглашения получит чужие строки журнала, квоту и счётчики
+CREATE TABLE IF NOT EXISTS retired_uids (uid TEXT PRIMARY KEY, at INTEGER NOT NULL);
+-- Запросы без строки (без проверенного участника, неизвестный путь, сверх квоты - quota:<uid>:<путь>, сбой записи -
 -- audit-error:<путь>) - счётчик: день (с 1970), класс пути, код ответа
 CREATE TABLE IF NOT EXISTS audit_denied (day INTEGER NOT NULL, route TEXT NOT NULL, status INTEGER NOT NULL, n INTEGER NOT NULL, PRIMARY KEY (day, route, status));

@@ -257,8 +257,15 @@ async function enrollInto(io, opts, { storage, teamCode, api, team }) {
     KB_API: api, KB_UID: s.me.uid, KB_SIGN_SK: s.me.secret.signSk, KB_BOX_SK: s.me.secret.boxSk,
     KB_TEAM_SECRET: team, KB_PIN: pinText(s.me.pin), KB_MASTER: master,
   };
-  // В тот же (уже закрытый) файл: r+ не создаёт новый и не меняет права
-  writeFileSync(opts.out, JSON.stringify(creds, null, 1) + '\n', { flag: 'r+' });
+  // В тот же (уже закрытый) файл: r+ не создаёт новый и не меняет права.
+  // Заявка уже на сервере, а ключей к ней нет ни у кого: владелец должен её отклонить - говорим, какую
+  try {
+    (io.writeFile || writeFileSync)(opts.out, JSON.stringify(creds, null, 1) + '\n', { flag: 'r+' });
+  } catch (e) {
+    const code = await s.myCode().catch(() => '');
+    throw new V.VaultError('Заявка отправлена, но ключи не записаны в ' + opts.out + ' (' + (e?.code || e?.name || 'ошибка') + '). '
+      + 'Попросите владельца отклонить заявку ' + code + ' (uid ' + s.me.uid + ') и повторите enroll.');
+  }
   io.out('Заявка отправлена.');
   io.out('uid: ' + s.me.uid);
   io.out('Код участника (сверить с окном заявки у владельца): ' + await s.myCode());

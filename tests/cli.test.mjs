@@ -260,6 +260,17 @@ await test('enroll на Windows: файл закрыт icacls до записи 
   await owner.refresh();
   assert.equal((await owner.pendingUsers()).length, pending);
   assert.equal(await run(3, { platform: 'linux' }), '');
+  // Заявка ушла, а запись ключей упала: владельцу - какую заявку отклонить (код участника и uid), файла нет
+  await owner.refresh();
+  const before = (await owner.pendingUsers()).map(u => u.uid);
+  const msg = await run(4, { platform: 'linux', writeFile: () => { throw Object.assign(new Error('диск'), { code: 'ENOSPC' }); } }, 1);
+  await owner.refresh();
+  const lost = (await owner.pendingUsers()).filter(u => !before.includes(u.uid));
+  assert.equal(lost.length, 1);
+  const lostCode = lost[0].code;
+  assert.match(msg, /ключи не записаны.*ENOSPC.*отклонить заявку/);
+  assert.ok(msg.includes(lostCode) && msg.includes(lost[0].uid), msg);
+  assert.equal(existsSync(join(tmp, 'win4.json')), false);
 });
 
 await test('ошибки: без ключей - подсказка, без значений', async () => {

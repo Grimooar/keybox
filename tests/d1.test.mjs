@@ -73,6 +73,28 @@ await test('журнал: потолок и квота - на участника
   assert.deepEqual(today.map(r => r.route), ['api/people', 'api/people', 'audit-quota']);
   assert.equal(await db.addAudit(row(11 * DAY, noisy), q), 'row');
   assert.equal(await db.addAudit(row(11 * DAY, boss), q), 'row');
+  // Записи - своя квота: чтения исчерпаны, а запись - строка; сверх writeDay - отметка audit-quota-write
+  const w = { ...q, writeDay: 2, write: true }, put = ts => ({ ...row(ts, noisy), method: 'PUT' });
+  for (let i = 0; i < 3; i++) await db.addAudit(row(12 * DAY + i, noisy), q);
+  const wr = [];
+  for (let i = 0; i < 4; i++) wr.push(await db.addAudit(put(12 * DAY + 10 + i), w));
+  assert.deepEqual(wr, ['row', 'row', 'quota', 'quota']);
+  const day12 = await db.listAudit({ uid: noisy, after: 0, since: 12 * DAY, limit: 100 });
+  assert.deepEqual(day12.map(r => r.route), ['api/people', 'api/people', 'audit-quota', 'api/people', 'api/people', 'audit-quota-write']);
+  const counts = await db.listAuditCount({ sinceDay: 12 });
+  assert.deepEqual(counts.map(c => ({ ...c })), [{ uid: noisy, day: 12, n_day: 3, w_day: 4 }]);
+  // n_all - только записанные строки: сверхквотные не сдвигают чистку по потолку
+  const nAll = sqlite.prepare('SELECT n_all FROM audit_count WHERE uid = ?').get(noisy).n_all;
+  await db.addAudit(row(12 * DAY + 50, noisy), q);
+  assert.equal(sqlite.prepare('SELECT n_all FROM audit_count WHERE uid = ?').get(noisy).n_all, nAll);
+});
+
+await test('погашенные uid: занять заново нельзя', async () => {
+  const u = 'f'.repeat(32);
+  assert.equal(await db.isRetired(u), false);
+  await db.retireUid(u, 1);
+  await db.retireUid(u, 2);
+  assert.equal(await db.isRetired(u), true);
 });
 
 await test('миграция: старая таблица audit (ip NOT NULL без умолчания или ip nullable) принимает запись сервера', async () => {
